@@ -1,0 +1,10 @@
+node_modules/
+src/
+*.ts
+!dist/**
+tsconfig.json
+tsconfig.build.json
+gulpfile.js
+eslint.config.mjs
+.eslintrc.js
+.gitignore
