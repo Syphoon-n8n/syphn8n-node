@@ -809,7 +809,7 @@ export class Syphoon implements INodeType {
     displayName: 'Syphoon',
     name:        'syphoon',
     icon:        'file:icon.svg',
-    group:       ['transform'],
+    group: ['input'],
     version:     1,
     documentationUrl: 'https://docs.syphoon.com'
     description: 'Scrape any URL and get back structured data auto-detected by page type: product, listing, article, or generic.',
