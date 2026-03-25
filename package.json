@@ -7,23 +7,21 @@
     "n8n",
     "syphoon",
     "amazon",
-    "price-monitoring",
-    "price-intelligence",
     "ecommerce",
     "scraping",
     "asin",
     "competitor-tracking"
   ],
-  "license": "MIT",
+  "license": "Syphoon",
   "homepage": "https://syphoon.com",
   "author": {
-    "name": "Vigasini",
-    "email": "vigasinimit@gmail.com",
-    "url": "https://github.com/vigasinii"
+    "name": "Syphoon",
+    "email": "deepak@syphoon.com",
+    "url": "https://github.com/Syphoon-n8n/syphn8n-node"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/vigasinii/n8n-nodes-syphoon"
+    "url": "https://github.com/Syphoon-n8n/syphn8n-node"
   },
   "main": "index.js",
   "scripts": {
