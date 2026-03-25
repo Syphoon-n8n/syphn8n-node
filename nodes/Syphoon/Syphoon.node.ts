@@ -9,875 +9,845 @@ import {
   JsonObject,
 } from 'n8n-workflow';
 
+// ─── Constants ────────────────────────────────────────────────────────────────
 
+const SYPHOON_API      = 'https://api.syphoon.com/';
+const MAX_SITEMAP_URLS = 100;
+const FETCH_TIMEOUT_MS = 30_000;
+const RETRY_DELAY_MS   = 2_000;
+const PAGE_DELAY_MS    = 1_200;
+const RATE_LIMIT_DELAY = 5_000;
+const MAX_RETRIES      = 2;
 
-const SYPHOON_TRACKING_URL = 'https://api.syphoon.com';
+// ─── Types ────────────────────────────────────────────────────────────────────
 
+type SearchEngine = 'google' | 'bing' | 'amazon';
+type PageContext  = 'product' | 'listing' | 'article' | 'generic';
 
-
-function getText(html: string, re: RegExp, group = 1): string | null {
-  const m = html.match(re);
-  return m && m[group] ? m[group].trim() : null;
+interface PageMeta {
+  url:         string;
+  title:       string | null;
+  h1:          string | null;
+  description: string | null;
+  canonical:   string | null;
+  word_count:  number;
+  scraped_at:  string;
 }
 
-function parsePrice(html: string): number | null {
-  const whole = getText(html, /class="a-price-whole">([\d,]+)</);
-  const frac  = getText(html, /class="a-price-fraction">(\d+)</);
-  if (whole) return parseFloat(whole.replace(/,/g, '') + '.' + (frac ?? '00'));
+interface SearchResult {
+  position:     number;
+  url?:         string;
+  asin?:        string;
+  title:        string | null;
+  snippet?:     string | null;
+  price?:       number | null;
+  rating?:      number | null;
+  image_url?:   string | null;
+  product_url?: string;
+}
 
-  const core = getText(html, /corePriceDisplay[\s\S]{0,500}?a-offscreen["'][^>]*>\$([\d,.]+)/) ??
-               getText(html, /class="a-offscreen">\$([\d,.]+)<\/span>/);
-  if (core) return parseFloat(core.replace(/,/g, ''));
+interface ProductData {
+  name:          string | null;
+  price:         string | null;
+  price_numeric: number | null;
+  currency:      string | null;
+  rating:        number | null;
+  review_count:  number | null;
+  availability:  string | null;
+  brand:         string | null;
+  sku:           string | null;
+  images:        string[];
+  description:   string | null;
+}
 
-  const json = getText(html, /"buyingPrice"\s*:\s*"?([\d.]+)/) ??
-               getText(html, /"price"\s*:\s*"?\$([\d,.]+)/);
-  if (json) return parseFloat(json.replace(/,/g, ''));
+interface ListingItem {
+  title:     string | null;
+  url:       string | null;
+  price:     string | null;
+  image_url: string | null;
+  rating:    number | null;
+}
+
+interface ArticleData {
+  headline:      string | null;
+  author:        string | null;
+  published_at:  string | null;
+  modified_at:   string | null;
+  section:       string | null;
+  tags:          string[];
+  body:          string | null;
+  read_time_min: number | null;
+}
+
+// ─── Utilities ────────────────────────────────────────────────────────────────
+
+const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+function normalizeUrl(url: string): string {
+  url = url.trim();
+  return url.startsWith('http://') || url.startsWith('https://') ? url : `https://${url}`;
+}
+
+function getOrigin(url: string): string {
+  try { return new URL(url).origin; } catch { return url; }
+}
+
+function stripHtml(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+    .replace(/\s+/g, ' ').trim();
+}
+
+function reGet(html: string, re: RegExp): string | null {
+  return re.exec(html)?.[1]?.trim() ?? null;
+}
+
+function isAmazonUrl(url: string): boolean {
+  return /amazon\.(com|co\.uk|in|de|fr|ca|com\.au|co\.jp)/.test(url);
+}
+
+// ─── Extractors ───────────────────────────────────────────────────────────────
+
+function extractMeta(html: string, url: string): PageMeta {
+  const rawTitle  = reGet(html, /<title[^>]*>([\s\S]{1,200}?)<\/title>/i);
+  const cleanTitle = rawTitle ? stripHtml(rawTitle) : null;
+  const text       = stripHtml(html);
+
+  // Amazon: h1 is typically a button ("Adding to Cart..."), not the product name.
+  // Use #productTitle span if present, otherwise derive from <title> by stripping suffix.
+  let h1: string | null;
+  if (isAmazonUrl(url)) {
+    h1 = reGet(html, /id=["']productTitle["'][^>]*>\s*([\s\S]{3,300}?)\s*<\/span>/i)
+      ?? (cleanTitle ? cleanTitle.replace(/\s*[:|]\s*Amazon\.com.*$/i, '').trim() : null);
+  } else {
+    const rawH1 = reGet(html, /<h1[^>]*>([\s\S]{1,200}?)<\/h1>/i);
+    h1 = rawH1 ? stripHtml(rawH1) : null;
+  }
+
+  return {
+    url,
+    title:       cleanTitle,
+    h1,
+    description: reGet(html, /<meta[^>]+name=["']description["'][^>]+content=["']([^"']{1,500})["']/i)
+                   ?? reGet(html, /<meta[^>]+content=["']([^"']{1,500})["'][^>]+name=["']description["']/i),
+    canonical:   reGet(html, /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i),
+    word_count:  text.split(/\s+/).filter(Boolean).length,
+    scraped_at:  new Date().toISOString(),
+  };
+}
+
+function extractText(html: string): string {
+  return stripHtml(html);
+}
+
+function extractMarkdown(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<h1[^>]*>([\s\S]*?)<\/h1>/gi,            '\n# $1\n')
+    .replace(/<h2[^>]*>([\s\S]*?)<\/h2>/gi,            '\n## $1\n')
+    .replace(/<h3[^>]*>([\s\S]*?)<\/h3>/gi,            '\n### $1\n')
+    .replace(/<h[4-6][^>]*>([\s\S]*?)<\/h[4-6]>/gi,   '\n#### $1\n')
+    .replace(/<strong[^>]*>([\s\S]*?)<\/strong>/gi,    '**$1**')
+    .replace(/<b[^>]*>([\s\S]*?)<\/b>/gi,              '**$1**')
+    .replace(/<em[^>]*>([\s\S]*?)<\/em>/gi,            '*$1*')
+    .replace(/<i[^>]*>([\s\S]*?)<\/i>/gi,              '*$1*')
+    .replace(/<a[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, '[$2]($1)')
+    .replace(/<li[^>]*>([\s\S]*?)<\/li>/gi,            '- $1\n')
+    .replace(/<br\s*\/?>/gi,                           '\n')
+    .replace(/<p[^>]*>([\s\S]*?)<\/p>/gi,              '\n$1\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+    .replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function extractLinks(html: string, baseUrl: string): string[] {
+  const origin = getOrigin(baseUrl);
+  const links  = new Set<string>();
+  const re     = /href=["']([^"'#?]+)/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const href = m[1].trim();
+    if (!href || /^(mailto:|tel:|javascript:)/.test(href)) continue;
+    const full = href.startsWith('http') ? href
+               : href.startsWith('/')   ? `${origin}${href}`
+               : `${origin}/${href}`;
+    if (full.startsWith(origin)) links.add(full);
+  }
+  return [...links];
+}
+
+function extractImages(html: string): string[] {
+  const imgs = new Set<string>();
+  const re   = /<img[^>]+src=["']([^"']+)["']/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) imgs.add(m[1]);
+  return [...imgs];
+}
+
+function extractStructuredData(html: string): IDataObject[] {
+  const blocks: IDataObject[] = [];
+  const re = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    try { blocks.push(JSON.parse(m[1].trim()) as IDataObject); } catch { /* skip malformed */ }
+  }
+  return blocks;
+}
+
+function extractOpenGraph(html: string): IDataObject {
+  const og: IDataObject = {};
+  const re = /<meta[^>]+property=["'](og:[^"']+)["'][^>]+content=["']([^"']*)["']/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) og[m[1].replace('og:', '')] = m[2];
+  return og;
+}
+
+// ─── Amazon-specific extractors ───────────────────────────────────────────────
+
+/**
+ * Amazon buries the full price across two separate spans:
+ *   <span class="a-price-whole">3</span><span class="a-price-fraction">25</span>
+ * We must join them. Also handles Subscribe & Save price and plain text price.
+ */
+function extractAmazonPrice(html: string): { raw: string | null; numeric: number | null; currency: string | null } {
+  // 1. Whole + fraction spans (most common)
+  const wholeM    = html.match(/class="a-price-whole"[^>]*>\s*([\d,]+)\s*</);
+  const fracM     = html.match(/class="a-price-fraction"[^>]*>\s*(\d{2})\s*</);
+  if (wholeM) {
+    const whole   = wholeM[1].replace(/,/g, '');
+    const frac    = fracM?.[1] ?? '00';
+    const raw     = `$${whole}.${frac}`;
+    return { raw, numeric: parseFloat(`${whole}.${frac}`), currency: '$' };
+  }
+
+  // 2. data-a-price attribute (compact format)
+  const dataPrice = reGet(html, /data-a-price=["']([\d.]+)["']/);
+  if (dataPrice) {
+    return { raw: `$${dataPrice}`, numeric: parseFloat(dataPrice), currency: '$' };
+  }
+
+  // 3. Plain text price pattern near price-related elements
+  const plainM = html.match(/id=["']priceblock_ourprice["'][^>]*>\s*\$?([\d,]+\.?\d{0,2})/);
+  if (plainM) {
+    const n = parseFloat(plainM[1].replace(/,/g, ''));
+    return { raw: `$${plainM[1]}`, numeric: n, currency: '$' };
+  }
+
+  return { raw: null, numeric: null, currency: null };
+}
+
+/**
+ * Amazon's main product images are in a JS variable 'colorImages' or 'ImageBlockATF'.
+ * Thumbnail <img> tags are tiny (SX38, SY50) — we want the hi-res versions.
+ * Strategy: grab all image IDs from thumbnails, reconstruct hi-res URLs.
+ */
+function extractAmazonImages(html: string): string[] {
+  const images = new Set<string>();
+
+  // 1. Parse 'colorImages' JS block — most reliable source
+  const colorImagesM = html.match(/'colorImages'\s*:\s*\{[^}]*'initial'\s*:\s*(\[[\s\S]*?\])\s*\}/);
+  if (colorImagesM) {
+    try {
+      const arr = JSON.parse(colorImagesM[1]) as Array<{ hiRes?: string; large?: string; main?: { [k: string]: unknown } }>;
+      for (const img of arr) {
+        const src = img.hiRes ?? img.large;
+        if (src && typeof src === 'string') images.add(src);
+      }
+    } catch { /* fallback below */ }
+  }
+
+  // 2. ImageBlockATF data block
+  if (images.size === 0) {
+    const ibM = html.match(/var\s+data\s*=\s*\{[\s\S]*?"colorImages"\s*:\s*\{"initial"\s*:\s*(\[[\s\S]*?\])/);
+    if (ibM) {
+      try {
+        const arr = JSON.parse(ibM[1]) as Array<{ hiRes?: string; large?: string }>;
+        for (const img of arr) {
+          const src = img.hiRes ?? img.large;
+          if (src && typeof src === 'string') images.add(src);
+        }
+      } catch { /* fallback below */ }
+    }
+  }
+
+  // 3. Fallback: grab only non-thumbnail, non-sprite product images
+  // Amazon product images have IDs like /images/I/XXXXXXXX. and no size suffix like _SX38_ or _CR,
+  if (images.size === 0) {
+    const re = /https:\/\/m\.media-amazon\.com\/images\/I\/([A-Za-z0-9%-]+\.[a-z]+)/gi;
+    let m;
+    while ((m = re.exec(html)) !== null) {
+      const url = m[0];
+      // Skip thumbnails (contain size codes like _SX38_, _SY50_, _CR,)
+      if (!/_SX\d+_|_SY\d+_|_CR,|sprites|gno\/sprites/.test(url)) {
+        // Reconstruct to get largest version by stripping size suffix
+        const hiRes = url.replace(/_[A-Z]{2}\d+[^.]*(\.[a-z]+)$/, '$1')
+                         .replace(/_[A-Z]+_\.[a-z]+$/, '');
+        images.add(hiRes.endsWith('.jpg') || hiRes.endsWith('.png') ? hiRes : url);
+      }
+    }
+  }
+
+  return [...images].slice(0, 10);
+}
+
+/** Pull brand from #bylineInfo link or "by BrandName" text near the title */
+function extractAmazonBrand(html: string): string | null {
+  return reGet(html, /id=["']bylineInfo["'][^>]*>\s*(?:Brand:|Visit the)?\s*<[^>]*>\s*([^<]{2,80})/)
+    ?? reGet(html, /id=["']bylineInfo["'][^>]*>\s*(?:Brand:|by\s+)([^<\n]{2,60})/)
+    ?? reGet(html, /class=["'][^"']*bylineInfo[^"']*["'][^>]*>\s*(?:Brand:|Visit the\s+)?([^<\n]{2,60})/)
+    ?? null;
+}
+
+/** ASIN is the SKU on Amazon — in the URL or a hidden input */
+function extractAmazonSku(html: string, url: string): string | null {
+  // From URL: /dp/ASIN or /product/ASIN
+  const urlM = url.match(/\/(?:dp|product|gp\/product)\/([A-Z0-9]{10})/);
+  if (urlM) return urlM[1];
+  return reGet(html, /name=["']ASIN["'][^>]+value=["']([A-Z0-9]{10})["']/)
+    ?? reGet(html, /"ASIN"\s*:\s*"([A-Z0-9]{10})"/)
+    ?? null;
+}
+
+/** #productDescription or #feature-bullets for description */
+function extractAmazonDescription(html: string): string | null {
+  const descM = html.match(/id=["']productDescription["'][^>]*>([\s\S]{20,2000}?)<\/div>/i);
+  if (descM) return stripHtml(descM[1]).slice(0, 1000).trim() || null;
+
+  // Fallback: feature bullets
+  const bulletsM = html.match(/id=["']feature-bullets["'][^>]*>([\s\S]{20,2000}?)<\/div>/i);
+  if (bulletsM) return stripHtml(bulletsM[1]).slice(0, 1000).trim() || null;
 
   return null;
 }
 
-function parseProduct(html: string, asin: string): IDataObject {
-  const current_price = parsePrice(html);
+/** #productTitle span — the real product name */
+function extractAmazonName(html: string, url: string, meta: PageMeta): string | null {
+  const fromSpan = reGet(html, /id=["']productTitle["'][^>]*>\s*([\s\S]{3,300}?)\s*<\/span>/i);
+  if (fromSpan) return stripHtml(fromSpan).trim();
 
-  const orig_raw = getText(html, /class="a-price a-text-price[^"]*"[^>]*>\s*<span[^>]*>\$([\d,.]+)/) ??
-                   getText(html, /basisPrice[^>]*>[\s\S]{0,100}?\$([\d,.]+)/);
-  const original_price = orig_raw ? parseFloat(orig_raw.replace(/,/g, '')) : null;
-  const sale_price = original_price && current_price && current_price < original_price ? current_price : null;
+  // Derive from <title> by stripping " : Amazon.com : ..." suffix
+  if (meta.title) return meta.title.replace(/\s*[:|]\s*Amazon\.com.*$/i, '').trim() || null;
 
-  const title = getText(html, /id="productTitle"[^>]*>\s*([\s\S]{1,300}?)\s*<\/span>/) ??
-                getText(html, /"title"\s*:\s*"([^"]{5,200})"/) ??
-                getText(html, /<title>([^<]{5,200})<\/title>/);
+  return null;
+}
 
-  const brand = getText(html, /id="bylineInfo"[^>]*>[\s\S]{0,400}?(?:Visit the |Brand: ?)([^<\n]{2,60})(?:<| Store)/) ??
-                getText(html, /"brand"\s*:\s*"([^"]{1,100})"/) ??
-                getText(html, /class="po-brand"[\s\S]{0,200}?<td[^>]*>\s*<span[^>]*>([^<]{1,80})</);
+// ─── Page context detection ───────────────────────────────────────────────────
 
-  const rating_str  = getText(html, /(\d\.\d) out of 5 stars/) ??
-                      getText(html, /"ratingScore"\s*:\s*"?([\d.]+)/);
-  const reviews_str = getText(html, /([\d,]+)\s+(?:global )?ratings/) ??
-                      getText(html, /id="acrCustomerReviewText"[^>]*>([\d,]+)/);
-
-  const img = getText(html, /id="landingImage"[^>]*data-old-hires="([^"]+)"/) ??
-              getText(html, /id="landingImage"[^>]*src="([^"]+)"/) ??
-              getText(html, /"large"\s*:\s*"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+)"/) ??
-              getText(html, /data-a-dynamic-image="[^"]*?(https:\/\/m\.media-amazon\.com\/images\/I\/[^"\\]+)/);
-
-  const avail_raw = getText(html, /id="availability"[^>]*>[\s\S]{0,300}?<span[^>]*>\s*([^<\n]{3,80})/);
-  let availability = 'In Stock';
-  if (avail_raw) {
-    const al = avail_raw.toLowerCase();
-    if (al.includes('out of stock') || al.includes('unavailable')) availability = 'Out of Stock';
-    else if (al.includes('only') || al.includes('limited'))        availability = 'Limited Stock';
-    else availability = avail_raw.replace(/\s+/g, ' ').trim();
+function detectPageContext(html: string, url: string): PageContext {
+  const ldBlocks = extractStructuredData(html);
+  for (const block of ldBlocks) {
+    const t = ((block['@type'] as string | undefined) ?? '').toLowerCase();
+    if (['product', 'offer'].some(k => t.includes(k)))                               return 'product';
+    if (['newsarticle', 'article', 'blogposting', 'review'].some(k => t.includes(k))) return 'article';
+    if (['itemlist', 'offerlist', 'productgroup'].some(k => t.includes(k)))           return 'listing';
   }
 
-  let seller = 'Third Party';
-  if (html.includes('Sold by Amazon') || html.includes('Ships from Amazon.com') || html.includes('Fulfilled by Amazon')) {
-    seller = 'Amazon';
+  const og = extractOpenGraph(html);
+  if (og['type'] === 'product') return 'product';
+  if (og['type'] === 'article') return 'article';
+
+  const path = url.toLowerCase();
+  if (/\/(product|item|dp|gp|sku|p)\b|\/p-\d|\/\d{5,}/.test(path))         return 'product';
+  if (/\/(search|results|listing|category|shop|store|browse)/.test(path))    return 'listing';
+  if (/\/(blog|news|article|post|story|press)\b/.test(path))                 return 'article';
+
+  const hasPriceEl  = /<[^>]+(itemprop=["']price|class="[^"]*price[^"]*")[^>]*>/i.test(html);
+  const hasAddCart  = /add.to.cart|buy.now|add.to.bag/i.test(html);
+  const hasMultiImg = (html.match(/<img\s/gi) ?? []).length > 8;
+  const hasLongBody = stripHtml(html).split(/\s+/).length > 600;
+  const hasAuthor   = /itemprop=["']author|class="[^"]*author[^"]*"/i.test(html);
+  const hasArticle  = /<article[\s>]/i.test(html);
+
+  if (hasPriceEl && hasAddCart)                  return 'product';
+  if (hasPriceEl && hasMultiImg)                 return 'listing';
+  if ((hasAuthor || hasArticle) && hasLongBody)  return 'article';
+
+  return 'generic';
+}
+
+// ─── Structured extractors ────────────────────────────────────────────────────
+
+function extractProductData(html: string, url: string): ProductData {
+  const meta      = extractMeta(html, url);
+  const isAmazon  = isAmazonUrl(url);
+
+  // ── Amazon fast-path ──────────────────────────────────────────────────────
+  if (isAmazon) {
+    const { raw: price, numeric: priceNumeric, currency } = extractAmazonPrice(html);
+    const ldBlocks  = extractStructuredData(html);
+    const ldProduct = ldBlocks.find(b =>
+      ((b['@type'] as string | undefined) ?? '').toLowerCase().includes('product')
+    );
+    const ldAggRating = ldProduct?.['aggregateRating'] as IDataObject | undefined;
+
+    return {
+      name:          extractAmazonName(html, url, meta),
+      price,
+      price_numeric: priceNumeric,
+      currency,
+      rating:        ldAggRating?.['ratingValue'] != null
+                       ? parseFloat(String(ldAggRating['ratingValue']))
+                       : parseFloat(reGet(html, /(\d\.\d)\s+out of 5/) ?? '') || null,
+      review_count:  ldAggRating?.['reviewCount'] != null
+                       ? parseInt(String(ldAggRating['reviewCount']), 10)
+                       : parseInt((reGet(html, /([\d,]+)\s+(?:global\s+)?ratings?/i) ?? '').replace(/,/g, ''), 10) || null,
+      availability:  html.match(/id=["']availability["'][^>]*>[\s\S]*?In Stock/i)
+                       ? 'InStock'
+                       : html.match(/out.of.stock|currently.unavailable/i)
+                       ? 'OutOfStock' : 'InStock',
+      brand:         extractAmazonBrand(html),
+      sku:           extractAmazonSku(html, url),
+      images:        extractAmazonImages(html),
+      description:   extractAmazonDescription(html),
+    };
   }
-  const seller_name = getText(html, /id="sellerProfileTriggerId"[^>]*>([^<]{1,80})</) ??
-                      getText(html, /(?:Sold by|Ships from)\s*<[^>]*>\s*([^<]{1,60})</) ??
-                      seller;
+
+  // ── Generic product page ──────────────────────────────────────────────────
+  const ldBlocks  = extractStructuredData(html);
+  const ldProduct = ldBlocks.find(b =>
+    ((b['@type'] as string | undefined) ?? '').toLowerCase().includes('product')
+  );
+
+  const ldOffers = ldProduct?.['offers'] as IDataObject | IDataObject[] | undefined;
+  const ldOffer  = Array.isArray(ldOffers) ? ldOffers[0] : ldOffers;
+
+  const rawPrice: string | null =
+    (ldOffer?.['price']   != null ? String(ldOffer['price'])   : null) ??
+    (ldProduct?.['price'] != null ? String(ldProduct['price']) : null) ??
+    reGet(html, /<meta[^>]+itemprop=["']price["'][^>]+content=["']([^"']+)["']/i) ??
+    reGet(html, /itemprop=["']price["'][^>]*>\s*([£$€¥₹]?[\d,]+\.?\d{0,2})/) ??
+    reGet(html, /class="[^"]*(?:price|Price)[^"]*"[^>]*>\s*([£$€¥₹]?[\d,]+\.?\d{0,2})/) ??
+    null;
+
+  const priceNumeric = rawPrice ? parseFloat(rawPrice.replace(/[^0-9.]/g, '')) || null : null;
+
+  const currency: string | null =
+    rawPrice?.match(/[£$€¥₹]/)?.[0] ??
+    reGet(html, /<meta[^>]+itemprop=["']priceCurrency["'][^>]+content=["']([^"']+)["']/i) ??
+    (ldOffer?.['priceCurrency'] != null ? String(ldOffer['priceCurrency']) : null) ??
+    null;
+
+  const ldAggRating = ldProduct?.['aggregateRating'] as IDataObject | undefined;
+
+  const ratingRaw: string | null =
+    (ldAggRating?.['ratingValue'] != null ? String(ldAggRating['ratingValue']) : null) ??
+    reGet(html, /itemprop=["']ratingValue["'][^>]*content=["']([^"']+)["']/i) ??
+    reGet(html, /class="[^"]*(?:rating|stars?)[^"]*"[^>]*>\s*([\d.]+)/i) ??
+    null;
+
+  const reviewRaw: string | null =
+    (ldAggRating?.['reviewCount'] != null ? String(ldAggRating['reviewCount']) : null) ??
+    reGet(html, /itemprop=["']reviewCount["'][^>]*content=["']([^"']+)["']/i) ??
+    reGet(html, /([\d,]+)\s+(?:reviews?|ratings?)/i) ??
+    null;
+
+  const images = new Set<string>();
+  const imgRe  = /<img[^>]+src=["']([^"']+)["']/gi;
+  let imgM;
+  while ((imgM = imgRe.exec(html)) !== null) {
+    const src = imgM[1];
+    if (/\.(jpg|jpeg|png|webp)/i.test(src) && !/icon|logo|sprite/i.test(src)) images.add(src);
+  }
+  const og = extractOpenGraph(html);
+  if (og['image']) images.add(og['image'] as string);
+
+  const ldBrand = ldProduct?.['brand'] as IDataObject | string | undefined;
+  const brandName: string | null =
+    ldBrand != null
+      ? (typeof ldBrand === 'object' ? String((ldBrand as IDataObject)['name'] ?? '') : String(ldBrand))
+      : null;
+
+  const ldName: string | null = ldProduct?.['name'] != null ? String(ldProduct['name']) : null;
+
+  const availability: string | null =
+    (ldOffer?.['availability'] != null ? String(ldOffer['availability']) : null) ??
+    reGet(html, /itemprop=["']availability["'][^>]*content=["']([^"']+)["']/i) ??
+    (html.match(/in.stock/i) ? 'InStock' : html.match(/out.of.stock|sold.out/i) ? 'OutOfStock' : null);
+
+  const sku: string | null =
+    (ldProduct?.['sku'] != null ? String(ldProduct['sku']) : null) ??
+    (ldProduct?.['mpn'] != null ? String(ldProduct['mpn']) : null) ??
+    reGet(html, /itemprop=["'](?:sku|mpn)["'][^>]*content=["']([^"']+)["']/i) ??
+    null;
+
+  const description: string | null =
+    (ldProduct?.['description'] != null ? String(ldProduct['description']) : null) ??
+    reGet(html, /itemprop=["']description["'][^>]*>\s*([\s\S]{20,1000}?)<\//i) ??
+    null;
 
   return {
-    asin,
-    title:             title ? title.replace(/&amp;/g, '&').replace(/&#\d+;/g, '').trim() : null,
-    brand:             brand ? brand.replace(/&amp;/g, '&').trim() : null,
-    current_price,
-    original_price,
-    sale_price,
-    rating:            rating_str ? parseFloat(rating_str) : null,
-    review_count:      reviews_str ? parseInt(reviews_str.replace(/,/g, ''), 10) : null,
+    name:          ldName || reGet(html, /itemprop=["']name["'][^>]*>\s*([^<]{3,200})/) || meta.h1,
+    price:         rawPrice,
+    price_numeric: priceNumeric,
+    currency,
+    rating:        ratingRaw ? parseFloat(ratingRaw) : null,
+    review_count:  reviewRaw ? parseInt(reviewRaw.replace(/[^0-9]/g, ''), 10) : null,
     availability,
-    seller:            seller_name,
-    is_sold_by_amazon: seller === 'Amazon',
-    image_url:         img ?? null,
-    product_url:       `https://www.amazon.com/dp/${asin}`,
-    scraped_at:        new Date().toISOString(),
+    brand:         brandName || reGet(html, /itemprop=["']brand["'][^>]*>\s*([^<]{2,80})/) || null,
+    sku,
+    images:        [...images].slice(0, 10),
+    description,
   };
 }
 
-function parseSearchResults(html: string): IDataObject[] {
-  const results: IDataObject[] = [];
-  const seen = new Set<string>();
+function extractListingItems(html: string, baseUrl: string): ListingItem[] {
+  const ldBlocks = extractStructuredData(html);
+  const ldList   = ldBlocks.find(b =>
+    ['itemlist', 'offerlist'].some(k =>
+      ((b['@type'] as string | undefined) ?? '').toLowerCase().includes(k)
+    )
+  );
+  if (ldList?.['itemListElement']) {
+    const els = ldList['itemListElement'] as IDataObject[];
+    return els.slice(0, 50).map(el => {
+      const item = (el['item'] as IDataObject) ?? el;
+      return {
+        title:     item['name'] != null ? String(item['name']) : null,
+        url:       item['url']  != null ? String(item['url'])  : null,
+        price:     null,
+        image_url: null,
+        rating:    null,
+      };
+    });
+  }
 
-  const asinPattern = /data-asin="([A-Z0-9]{10})"/g;
-  let match;
-  while ((match = asinPattern.exec(html)) !== null) {
-    const asin = match[1];
-    if (seen.has(asin) || asin === '0000000000') continue;
-    seen.add(asin);
+  const items  : ListingItem[] = [];
+  const seen    = new Set<string>();
+  const origin  = getOrigin(baseUrl);
+  const blockRe = /<(?:li|article|div)[^>]*class="[^"]*(?:product|item|card|result)[^"]*"[^>]*>([\s\S]{100,3000}?)<\/(?:li|article|div)>/gi;
+  let bm;
+  while ((bm = blockRe.exec(html)) !== null && items.length < 50) {
+    const block  = bm[1];
+    const linkM  = block.match(/href=["']([^"']+)["']/);
+    const titleM = block.match(/<(?:h[1-6]|a)[^>]*>\s*([^<]{5,200})\s*<\/(?:h[1-6]|a)>/);
+    const priceM = block.match(/([£$€¥₹]\s*[\d,]+\.?\d{0,2}|[\d,]+\.?\d{0,2}\s*(?:USD|EUR|GBP|INR))/i);
+    const imgM   = block.match(/<img[^>]+src=["']([^"']+)["']/);
+    const rateM  = block.match(/([\d.]+)\s*(?:\/\s*5|out of 5|\bstars?\b)/i);
 
-    const start = match.index;
-    const block = html.slice(start, start + 4000);
+    const href = linkM?.[1];
+    if (!href) continue;
+    const fullUrl = href.startsWith('http') ? href
+                  : href.startsWith('/')    ? `${origin}${href}`
+                  : `${origin}/${href}`;
+    if (seen.has(fullUrl)) continue;
+    seen.add(fullUrl);
 
-    const t1 = getText(block, /class="a-size-medium[^"]*"[^>]*>\s*([^<]{10,200})</);
-    const t2 = getText(block, /class="a-size-base-plus[^"]*"[^>]*>\s*([^<]{10,200})</);
-    const t3 = getText(block, /class="a-text-normal"[^>]*>\s*([^<]{10,200})</);
-    const t4 = getText(block, /aria-label="([^"]{10,200})"/);
+    items.push({
+      title:     titleM ? stripHtml(titleM[1]) : null,
+      url:       fullUrl,
+      price:     priceM?.[1]?.trim() ?? null,
+      image_url: imgM?.[1] ?? null,
+      rating:    rateM ? parseFloat(rateM[1]) : null,
+    });
+  }
+  return items;
+}
 
-    const badgePatterns = /^(amazon|overall pick|best seller|limited deal|sponsored|results|showing|sort by|filter|brand|price|rating)/i;
-    const rawTitle = [t1, t2, t3, t4].find(t => t && t.length > 10 && !badgePatterns.test(t.trim())) ?? null;
-    const title = rawTitle ? rawTitle.replace(/&#x27;/g, "'").replace(/&amp;/g, '&').trim() : null;
+function extractArticleData(html: string): ArticleData {
+  const ldBlocks = extractStructuredData(html);
+  const ldArt    = ldBlocks.find(b =>
+    ['article', 'newsarticle', 'blogposting', 'review'].some(k =>
+      ((b['@type'] as string | undefined) ?? '').toLowerCase().includes(k)
+    )
+  );
 
-    const priceWhole = getText(block, /class="a-price-whole">([\d,]+)</);
-    const priceFrac  = getText(block, /class="a-price-fraction">(\d+)</);
-    const price = priceWhole
-      ? parseFloat(priceWhole.replace(/,/g, '') + '.' + (priceFrac ?? '00'))
+  const ldAuthor = ldArt?.['author'] as IDataObject | string | undefined;
+  const authorName: string | null =
+    ldAuthor != null
+      ? (typeof ldAuthor === 'object' ? String((ldAuthor as IDataObject)['name'] ?? '') : String(ldAuthor))
       : null;
 
-    const rating  = getText(block, /(\d\.\d) out of 5/);
-    const reviews = getText(block, /([\d,]+)\s+ratings?/);
-    const img     = getText(block, /class="s-image"[^>]*src="([^"]+)"/) ??
-                    getText(block, /src="(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+)"/);
+  const articleMatch = html.match(/<article[^>]*>([\s\S]+?)<\/article>/i);
+  const bodyText     = stripHtml(articleMatch?.[1] ?? html).slice(0, 5000);
+  const wordCount    = bodyText.split(/\s+/).filter(Boolean).length;
 
-    if (asin && title) {
+  const keywordsRaw = reGet(html, /<meta[^>]+name=["']keywords["'][^>]+content=["']([^"']+)["']/i) ?? '';
+  const tags        = keywordsRaw.split(',').map(t => t.trim()).filter(Boolean).slice(0, 10);
+
+  return {
+    headline:
+      (ldArt?.['headline'] != null ? String(ldArt['headline']) : null) ??
+      reGet(html, /<h1[^>]*>([\s\S]{5,200}?)<\/h1>/i) ??
+      null,
+    author:
+      authorName ||
+      reGet(html, /(?:itemprop=["']author["']|class="[^"]*author[^"]*")[^>]*>\s*([^<]{3,80})/) ||
+      null,
+    published_at:
+      (ldArt?.['datePublished'] != null ? String(ldArt['datePublished']) : null) ??
+      reGet(html, /<(?:time|meta)[^>]+(?:datetime|content)=["']([^"']+T[^"']+)["']/i) ??
+      reGet(html, /<meta[^>]+property=["']article:published_time["'][^>]+content=["']([^"']+)["']/i) ??
+      null,
+    modified_at:
+      (ldArt?.['dateModified'] != null ? String(ldArt['dateModified']) : null) ??
+      reGet(html, /<meta[^>]+property=["']article:modified_time["'][^>]+content=["']([^"']+)["']/i) ??
+      null,
+    section:
+      (ldArt?.['articleSection'] != null ? String(ldArt['articleSection']) : null) ??
+      reGet(html, /<meta[^>]+property=["']article:section["'][^>]+content=["']([^"']+)["']/i) ??
+      null,
+    tags,
+    body:          bodyText || null,
+    read_time_min: wordCount > 0 ? Math.ceil(wordCount / 200) : null,
+  };
+}
+
+// ─── Sitemap ──────────────────────────────────────────────────────────────────
+
+function isSitemapUrl(url: string): boolean {
+  return url.endsWith('sitemap.xml') || (url.includes('sitemap') && url.endsWith('.xml'));
+}
+
+function parseSitemapUrls(xml: string): string[] {
+  const urls: string[] = [];
+  const re = /<loc>([\s\S]*?)<\/loc>/g;
+  let m;
+  while ((m = re.exec(xml)) !== null) {
+    const u = m[1].trim();
+    if (u) urls.push(u);
+  }
+  return urls;
+}
+
+// ─── Search ───────────────────────────────────────────────────────────────────
+
+function detectSearchEngine(url: string): SearchEngine | null {
+  if (url.includes('google.com/search'))  return 'google';
+  if (url.includes('bing.com/search'))    return 'bing';
+  if (/amazon\.(com|co\.uk|in|de|fr|ca|com\.au|co\.jp)\/s\?/.test(url)) return 'amazon';
+  return null;
+}
+
+function parseSearchResults(html: string, engine: SearchEngine): SearchResult[] {
+  const results: SearchResult[] = [];
+  const seen = new Set<string>();
+
+  if (engine === 'google') {
+    const re = /href="(https?:\/\/(?!(?:www\.)?google\.[^"]+)[^"&]{10,300})"/g;
+    let m;
+    while ((m = re.exec(html)) !== null && results.length < 10) {
+      const url = m[1];
+      if (seen.has(url)) continue;
+      seen.add(url);
+      const ctx   = html.slice(Math.max(0, m.index - 800), m.index + 800);
+      const title = ctx.match(/<h3[^>]*>([\s\S]{5,200}?)<\/h3>/)?.[1];
+      const snip  = ctx.match(/class="[^"]*(?:VwiC3b|IsZvec)[^"]*"[^>]*>([\s\S]{10,400}?)<\/(?:div|span)>/)?.[1];
+      results.push({ position: results.length + 1, url, title: title ? stripHtml(title) : null, snippet: snip ? stripHtml(snip) : null });
+    }
+  } else if (engine === 'bing') {
+    const re = /href="(https?:\/\/(?!(?:www\.)?(?:bing|microsoft)\.[^"]+)[^"&]{10,300})"/g;
+    let m;
+    while ((m = re.exec(html)) !== null && results.length < 10) {
+      const url = m[1];
+      if (seen.has(url)) continue;
+      seen.add(url);
+      const ctx   = html.slice(Math.max(0, m.index - 600), m.index + 600);
+      const title = ctx.match(/<h2[^>]*>([\s\S]{5,200}?)<\/h2>/)?.[1];
+      results.push({ position: results.length + 1, url, title: title ? stripHtml(title) : null });
+    }
+  } else if (engine === 'amazon') {
+    const re = /data-asin="([A-Z0-9]{10})"/g;
+    let m;
+    while ((m = re.exec(html)) !== null && results.length < 20) {
+      const asin = m[1];
+      if (seen.has(asin) || asin === '0000000000') continue;
+      seen.add(asin);
+      const block  = html.slice(m.index, m.index + 3000);
+      const t1     = block.match(/class="a-size-medium[^"]*"[^>]*>\s*([^<]{10,200})/)?.[1];
+      const t2     = block.match(/class="a-size-base-plus[^"]*"[^>]*>\s*([^<]{10,200})/)?.[1];
+      const title  = [t1, t2].find(t => t && t.length > 8) ?? null;
+      if (!title) continue;
+      const priceW = block.match(/class="a-price-whole"[^>]*>\s*([\d,]+)/)?.[1];
+      const priceF = block.match(/class="a-price-fraction"[^>]*>\s*(\d{2})/)?.[1];
+      const rateM  = block.match(/(\d\.\d) out of 5/);
       results.push({
+        position:    results.length + 1,
         asin,
-        title:        title.trim(),
-        price,
-        rating:       rating ? parseFloat(rating) : null,
-        review_count: reviews ? parseInt(reviews.replace(/,/g, ''), 10) : null,
-        image_url:    img ?? null,
-        product_url:  `https://www.amazon.com/dp/${asin}`,
+        title:       title.trim(),
+        price:       priceW ? parseFloat(priceW.replace(/,/g, '') + '.' + (priceF ?? '00')) : null,
+        rating:      rateM ? parseFloat(rateM[1]) : null,
+        image_url:   block.match(/class="s-image"[^>]*src="([^"]+)"/)?.[1] ?? null,
+        product_url: `https://www.amazon.com/dp/${asin}`,
       });
     }
-
-    if (results.length >= 20) break;
   }
+
   return results;
 }
 
-// ─── Auto keyword builder ─────────────────────────────────────────────────────
+// ─── API ──────────────────────────────────────────────────────────────────────
 
-function buildSearchKeyword(title: string, brand: string | null): { keyword: string; weight: string | null } {
-  // Extract weight/size from title e.g. 100g, 3.5oz, 85g, 200g
-  const weightMatch = title.match(/(\d+(?:\.\d+)?)\s*(g|kg|oz|ounce|lb|lbs|ml|l)\b/i);
-  const weight = weightMatch ? `${weightMatch[1]}${weightMatch[2].toLowerCase()}` : null;
-
-  // Strip brand from title if known
-  let cleaned = title;
-  if (brand) {
-    cleaned = cleaned.replace(new RegExp(brand, 'gi'), '').trim();
+async function syphoonFetch(
+  ctx:       IExecuteFunctions,
+  apiKey:    string,
+  url:       string,
+  itemIndex: number,
+): Promise<string> {
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    if (attempt > 0) await sleep(attempt * RETRY_DELAY_MS);
+    try {
+      const res = await ctx.helpers.request({
+        method:  'POST',
+        url:     SYPHOON_API,
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ url, key: apiKey, method: 'GET' }),
+        timeout: FETCH_TIMEOUT_MS,
+      });
+      if (typeof res === 'string') return res;
+      const r = res as IDataObject;
+      for (const k of ['data', 'html', 'body', 'result']) {
+        if (r[k] && typeof r[k] === 'string') return r[k] as string;
+      }
+      throw new NodeOperationError(ctx.getNode(), `Unexpected Syphoon response for: ${url}`, { itemIndex });
+    } catch (err: unknown) {
+      const e = err as { statusCode?: number };
+      if (e.statusCode === 402) throw new NodeOperationError(ctx.getNode(), 'Syphoon trial exhausted.', { itemIndex });
+      if (e.statusCode === 401 || e.statusCode === 403) throw new NodeOperationError(ctx.getNode(), 'Invalid Syphoon API key.', { itemIndex });
+      if (e.statusCode === 429 && attempt < MAX_RETRIES) { await sleep(RATE_LIMIT_DELAY); continue; }
+      if (attempt === MAX_RETRIES) throw new NodeApiError(ctx.getNode(), err as JsonObject, { itemIndex });
+    }
   }
-
-  // Remove common noise words
-  cleaned = cleaned
-    .replace(/\b(pack of|count|each|value|bundle|set|lot|case|box|bag)\b/gi, '')
-    .replace(/[^a-z0-9\s]/gi, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  // Take first 5-6 meaningful words
-  const words = cleaned.split(' ').filter(w => w.length > 2).slice(0, 6);
-  const keyword = words.join(' ') + (weight ? ` ${weight}` : '');
-
-  return { keyword: keyword.trim(), weight };
+  throw new NodeOperationError(ctx.getNode(), `Failed to fetch after retries: ${url}`, { itemIndex });
 }
 
-function matchesWeight(title: string, targetWeight: string): boolean {
-  if (!targetWeight) return true;
-  const num = parseFloat(targetWeight);
-  const unit = targetWeight.replace(/[\d.]/g, '').trim();
-  // Allow ±30% weight variance
-  const min = num * 0.7;
-  const max = num * 1.3;
-  const titleWeights = [...title.matchAll(/(\d+(?:\.\d+)?)\s*(g|kg|oz|ounce|lb|lbs)\b/gi)];
-  if (!titleWeights.length) return true; // no weight in title — don't filter out
-  return titleWeights.some(m => {
-    const w = parseFloat(m[1]);
-    const u = m[2].toLowerCase();
-    if (u === unit.toLowerCase()) return w >= min && w <= max;
-    return false;
-  });
+// ─── Output builders ──────────────────────────────────────────────────────────
+
+function buildPageOutput(html: string, url: string): IDataObject {
+  const context = detectPageContext(html, url);
+  const base: IDataObject = {
+    type:       'page',
+    context,
+    ...extractMeta(html, url),
+    open_graph: extractOpenGraph(html),
+    links:      extractLinks(html, url),
+  };
+
+  if (context === 'product') return { ...base, product: extractProductData(html, url) };
+  if (context === 'listing') return { ...base, items:   extractListingItems(html, url) };
+  if (context === 'article') return { ...base, article: extractArticleData(html) };
+
+  return { ...base, text: extractText(html), markdown: extractMarkdown(html) };
 }
 
-// ─── Price Intelligence ───────────────────────────────────────────────────────
-
-function normalisePriceIntelligence(product: IDataObject, myPrice: number, cost: number, marginFloor: number): IDataObject {
-  const current_price = product.current_price as number | null;
-  const min_viable    = parseFloat((cost * (1 + marginFloor / 100)).toFixed(2));
-
-  if (current_price === null) {
-    return { ...product, my_price: myPrice, cost, margin_floor: marginFloor, min_viable_price: min_viable };
+function buildSerpOutput(engine: SearchEngine, url: string, results: SearchResult[]): IDataObject[] {
+  if (!results.length) {
+    return [{ type: 'serp', engine, url, results: [], scraped_at: new Date().toISOString() }];
   }
+  return results.map(r => ({ type: 'serp', engine, scraped_at: new Date().toISOString(), ...r }));
+}
 
-  const gap_abs            = parseFloat((myPrice - current_price).toFixed(2));
-  const gap_pct            = parseFloat(((gap_abs / current_price) * 100).toFixed(2));
-  const competitor_cheaper = current_price < myPrice;
-  const margin_at_competitor = current_price > 0
-    ? parseFloat(((current_price - cost) / current_price * 100).toFixed(2))
-    : null;
-
-  let urgency = 'low';
-  let opportunity_score = 0;
-  if (competitor_cheaper) {
-    const abs = Math.abs(gap_pct);
-    if (abs > 15)     { urgency = 'critical'; opportunity_score = Math.min(100, 90 + (abs - 15)); }
-    else if (abs > 8) { urgency = 'high';     opportunity_score = 70 + (abs - 8) * 2; }
-    else if (abs > 3) { urgency = 'medium';   opportunity_score = 40 + (abs - 3) * 6; }
-    else              { urgency = 'low';       opportunity_score = 15; }
-  }
-
-  let recommendation = 'hold';
-  if (competitor_cheaper) {
-    recommendation = current_price >= min_viable
-      ? (Math.abs(gap_pct) > 10 ? 'match' : 'undercut')
-      : 'hold';
-  } else if (!competitor_cheaper && gap_pct > 20) {
-    recommendation = 'raise';
-  }
-
+function buildSitemapPageOutput(
+  html: string, url: string, index: number, total: number, sitemapSource: string,
+): IDataObject {
   return {
-    ...product,
-    my_price: myPrice,
-    cost,
-    margin_floor: marginFloor,
-    min_viable_price: min_viable,
-    gap_abs,
-    gap_pct,
-    competitor_cheaper,
-    margin_at_competitor,
-    profitable_at_competitor: margin_at_competitor !== null ? margin_at_competitor > 0 : null,
-    urgency,
-    opportunity_score: Math.min(100, Math.round(opportunity_score)),
-    recommendation,
+    type:           'sitemap_page',
+    index,
+    total,
+    sitemap_source: sitemapSource,
+    ...extractMeta(html, url),
+    text:           extractText(html),
+    markdown:       extractMarkdown(html),
   };
 }
 
-// ─── Alert helpers ────────────────────────────────────────────────────────────
+// ─── Handlers ─────────────────────────────────────────────────────────────────
 
-function buildDiscordEmbed(product: IDataObject): IDataObject {
-  const urgency = (product.urgency as string) ?? 'low';
-  const emoji   = urgency === 'critical' ? '🚨' : urgency === 'high' ? '⚠️' : urgency === 'medium' ? '📊' : '✅';
+async function handleSitemap(
+  ctx:       IExecuteFunctions,
+  apiKey:    string,
+  url:       string,
+  html:      string,
+  itemIndex: number,
+): Promise<INodeExecutionData[]> {
+  let urls = parseSitemapUrls(html);
 
-  const fields: IDataObject[] = [
-    { name: 'Competitor Price', value: `$${product.current_price}`,        inline: true },
-    { name: 'Your Price',       value: `$${product.my_price}`,             inline: true },
-    { name: 'Gap',              value: `${product.gap_pct}%`,              inline: true },
-    { name: 'Urgency',          value: String(urgency).toUpperCase(),      inline: true },
-    { name: 'Recommendation',   value: String(product.recommendation ?? '').toUpperCase(), inline: true },
-    { name: 'Opp. Score',       value: `${product.opportunity_score}/100`, inline: true },
-    { name: 'Availability',     value: String(product.availability),      inline: true },
-    { name: 'Seller',           value: String(product.seller),            inline: true },
-    { name: 'Min Viable Price', value: `$${product.min_viable_price}`,    inline: true },
-  ];
-
-  if (product.ai_recommendation) {
-    fields.push({ name: '🤖 AI Insight', value: String(product.ai_recommendation), inline: false });
+  const nested: string[] = [];
+  for (const sub of urls.filter(u => u.endsWith('.xml'))) {
+    try {
+      const subXml = await syphoonFetch(ctx, apiKey, sub, itemIndex);
+      nested.push(...parseSitemapUrls(subXml));
+      await sleep(PAGE_DELAY_MS);
+    } catch { /* skip broken sub-sitemaps */ }
   }
+  urls = [...urls.filter(u => !u.endsWith('.xml')), ...nested].slice(0, MAX_SITEMAP_URLS);
 
-  return {
-    embeds: [{
-      title:     `${emoji} Price Alert — ${product.title ?? product.asin}`,
-      color:     urgency === 'critical' ? 16711680 : urgency === 'high' ? 16737843 : 16755200,
-      fields,
-      url:       product.product_url as string,
-      footer:    { text: 'Syphoon Price Intelligence' },
-      timestamp: new Date().toISOString(),
-    }],
-  };
+  const items: INodeExecutionData[] = [];
+  for (let idx = 0; idx < urls.length; idx++) {
+    const pageUrl = urls[idx];
+    try {
+      const pageHtml = await syphoonFetch(ctx, apiKey, pageUrl, itemIndex);
+      items.push({ json: buildSitemapPageOutput(pageHtml, pageUrl, idx + 1, urls.length, url), pairedItem: itemIndex });
+    } catch (err) {
+      items.push({ json: { type: 'sitemap_page', index: idx + 1, url: pageUrl, error: (err as Error).message }, pairedItem: itemIndex });
+    }
+    if (idx < urls.length - 1) await sleep(PAGE_DELAY_MS);
+  }
+  return items;
 }
 
-function buildTelegramMessage(product: IDataObject): string {
-  const urgency = (product.urgency as string) ?? 'low';
-  const emoji   = urgency === 'critical' ? '🚨' : urgency === 'high' ? '⚠️' : '📊';
-
-  const lines = [
-    `${emoji} *Price Alert — ${product.title ?? product.asin}*`,
-    ``,
-    `💰 Competitor: *$${product.current_price}*`,
-    `🏷️ Your Price: *$${product.my_price}*`,
-    `📉 Gap: *${product.gap_pct}%*`,
-    `🎯 Recommendation: *${String(product.recommendation ?? '').toUpperCase()}*`,
-    `⚡ Urgency: *${String(urgency).toUpperCase()}*`,
-  ];
-
-  if (product.ai_recommendation) {
-    lines.push(``, `🤖 *AI Insight:* ${product.ai_recommendation}`);
-  }
-
-  lines.push(``, `[View on Amazon](${product.product_url})`);
-  return lines.join('\n');
+async function handleSerp(
+  engine: SearchEngine, url: string, html: string, itemIndex: number,
+): Promise<INodeExecutionData[]> {
+  const results = parseSearchResults(html, engine);
+  return buildSerpOutput(engine, url, results).map(json => ({ json, pairedItem: itemIndex }));
 }
 
-// ─── DB tracking helper ───────────────────────────────────────────────────────
-
-async function trackToSyphoon(
-  ctx: IExecuteFunctions,
-  endpoint: string,
-  body: IDataObject,
-  apiKey: string,
-): Promise<void> {
-  try {
-    await ctx.helpers.request({
-      method: 'POST',
-      url: `${SYPHOON_TRACKING_URL}${endpoint}`,
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Syphoon-Key': apiKey,
-      },
-      body: JSON.stringify(body),
-      timeout: 8000,
-    });
-  } catch {
-    // Silent fail — tracking should never break the main workflow
-  }
+async function handlePage(html: string, url: string, itemIndex: number): Promise<INodeExecutionData[]> {
+  return [{ json: buildPageOutput(html, url), pairedItem: itemIndex }];
 }
 
-// ─── Node definition ──────────────────────────────────────────────────────────
+// ─── Node ─────────────────────────────────────────────────────────────────────
 
 export class Syphoon implements INodeType {
   description: INodeTypeDescription = {
     displayName: 'Syphoon',
-    name: 'syphoon',
-    icon: 'file:icon.svg',
-    group: ['transform'],
-    version: 1,
-    subtitle: '={{$parameter["operation"]}}',
-    description: 'Amazon product scraping, competitor discovery, price intelligence, and alerts via Syphoon API',
-    defaults: { name: 'Syphoon' },
-    inputs: ['main'],
-    outputs: ['main'],
+    name:        'syphoon',
+    icon:        'file:icon.svg',
+    group:       ['transform'],
+    version:     1,
+    description: 'Scrape any URL and get back structured data auto-detected by page type: product, listing, article, or generic.',
+    defaults:    { name: 'Syphoon' },
+    inputs:      ['main'],
+    outputs:     ['main'],
     credentials: [{ name: 'syphoonApi', required: true }],
     properties: [
-
       {
-        displayName: 'Operation',
-        name: 'operation',
-        type: 'options',
-        noDataExpression: true,
-        options: [
-          { name: 'Get Product',                        value: 'getProduct',              description: 'Scrape a single Amazon product by ASIN',                                                          action: 'Get a product by ASIN' },
-          { name: 'Get Product with Price Intelligence', value: 'getProductIntelligence',  description: 'Scrape a product and calculate competitive pricing metrics against your price',                   action: 'Get product with price intelligence' },
-          { name: 'Batch Get Products',                 value: 'batchGetProducts',        description: 'Scrape multiple ASINs at once (rate-limited automatically)',                                      action: 'Batch get products' },
-          { name: 'Auto Discover Competitors',          value: 'autoDiscoverCompetitors', description: 'Enter your product ASIN — node automatically finds competitors by weight and category, no AI needed', action: 'Auto discover competitors from ASIN' },
-          { name: 'Discover Competitors with AI',       value: 'discoverCompetitors',     description: 'Search Amazon then use Groq AI to filter only products that match your product name and weight',  action: 'Discover competitors with AI' },
-          { name: 'Monitor Price and Alert',            value: 'monitorAndAlert',         description: 'Scrape a product, run price intelligence, and alert via Discord or Telegram when price drops',    action: 'Monitor price and send alert' },
-        ],
-        default: 'getProduct',
-      },
-
-      // ── ASIN ────────────────────────────────────────────────────────────
-      {
-        displayName: 'ASIN',
-        name: 'asin',
-        type: 'string',
-        default: '',
-        required: true,
-        displayOptions: { show: { operation: ['getProduct', 'getProductIntelligence', 'monitorAndAlert', 'autoDiscoverCompetitors'] } },
-        description: 'Amazon ASIN or full product URL',
-        placeholder: 'B07X41PWTY',
-      },
-
-      // ── Batch ASINs ──────────────────────────────────────────────────────
-      {
-        displayName: 'ASINs',
-        name: 'asins',
-        type: 'string',
-        default: '',
-        required: true,
-        displayOptions: { show: { operation: ['batchGetProducts'] } },
-        description: 'Comma-separated ASINs (max 50)',
-        placeholder: 'B07X41PWTY,B09B8RVKGM',
-      },
-
-      // ── Manual search keyword (AI discovery only) ────────────────────────
-      {
-        displayName: 'Search Keyword',
-        name: 'keyword',
-        type: 'string',
-        default: '',
-        required: true,
-        displayOptions: { show: { operation: ['discoverCompetitors'] } },
-        description: 'Amazon search keyword to find competitor products',
-        placeholder: 'thai rice chips 85g',
-      },
-
-      // ── Price Intelligence ───────────────────────────────────────────────
-      {
-        displayName: 'Your Current Price ($)',
-        name: 'myPrice',
-        type: 'number',
-        default: 0,
-        required: true,
-        displayOptions: { show: { operation: ['getProductIntelligence', 'monitorAndAlert', 'autoDiscoverCompetitors'] } },
-        description: 'Your listed price for this product on Amazon',
-      },
-      {
-        displayName: 'Your Cost ($)',
-        name: 'cost',
-        type: 'number',
-        default: 0,
-        required: true,
-        displayOptions: { show: { operation: ['getProductIntelligence', 'monitorAndAlert', 'autoDiscoverCompetitors'] } },
-        description: 'Your unit cost / COGS',
-      },
-      {
-        displayName: 'Minimum Margin (%)',
-        name: 'marginFloor',
-        type: 'number',
-        default: 20,
-        required: true,
-        displayOptions: { show: { operation: ['getProductIntelligence', 'monitorAndAlert', 'autoDiscoverCompetitors'] } },
-        description: 'Minimum acceptable profit margin percentage',
-      },
-
-      // ── AI Discovery ─────────────────────────────────────────────────────
-      {
-        displayName: 'Your Product Name',
-        name: 'myProductName',
-        type: 'string',
-        default: '',
-        required: true,
-        displayOptions: { show: { operation: ['discoverCompetitors'] } },
-        description: 'Full product name including weight for AI comparison',
-        placeholder: 'Thai Rice Chips by Natch 85g',
-      },
-      {
-        displayName: 'Groq API Key',
-        name: 'groqApiKey',
-        type: 'string',
-        typeOptions: { password: true },
-        default: '',
-        required: true,
-        displayOptions: { show: { operation: ['discoverCompetitors'] } },
-        description: 'Your Groq API key. Get one free at console.groq.com',
-      },
-
-      // ── Alert settings ───────────────────────────────────────────────────
-      {
-        displayName: 'Alert Channel',
-        name: 'alertChannel',
-        type: 'options',
-        required: true,
-        displayOptions: { show: { operation: ['monitorAndAlert'] } },
-        options: [
-          { name: 'Discord Webhook',          value: 'discord' },
-          { name: 'Telegram Bot',             value: 'telegram' },
-          { name: 'Both Discord + Telegram',  value: 'both' },
-          { name: 'None (return data only)',  value: 'none' },
-        ],
-        default: 'discord',
-      },
-      {
-        displayName: 'Discord Webhook URL',
-        name: 'discordWebhook',
-        type: 'string',
-        default: '',
-        displayOptions: { show: { operation: ['monitorAndAlert'], alertChannel: ['discord', 'both'] } },
-        placeholder: 'https://discord.com/api/webhooks/...',
-      },
-      {
-        displayName: 'Telegram Bot Token',
-        name: 'telegramToken',
-        type: 'string',
-        typeOptions: { password: true },
-        default: '',
-        displayOptions: { show: { operation: ['monitorAndAlert'], alertChannel: ['telegram', 'both'] } },
-      },
-      {
-        displayName: 'Telegram Chat ID',
-        name: 'telegramChatId',
-        type: 'string',
-        default: '',
-        displayOptions: { show: { operation: ['monitorAndAlert'], alertChannel: ['telegram', 'both'] } },
-        placeholder: '-1001234567890',
-      },
-      {
-        displayName: 'Alert Only on Price Drop',
-        name: 'alertOnDropOnly',
-        type: 'boolean',
-        default: true,
-        displayOptions: { show: { operation: ['monitorAndAlert'] } },
-      },
-      {
-        displayName: 'Minimum Urgency to Alert',
-        name: 'minUrgency',
-        type: 'options',
-        default: 'high',
-        displayOptions: { show: { operation: ['monitorAndAlert'] } },
-        options: [
-          { name: 'Any (low+)',    value: 'low' },
-          { name: 'Medium+',       value: 'medium' },
-          { name: 'High+',         value: 'high' },
-          { name: 'Critical only', value: 'critical' },
-        ],
-      },
-      {
-        displayName: 'Enable AI Pricing Recommendation',
-        name: 'enableAI',
-        type: 'boolean',
-        default: false,
-        displayOptions: { show: { operation: ['monitorAndAlert'] } },
-      },
-      {
-        displayName: 'Groq API Key (for AI Recommendation)',
-        name: 'groqApiKeyAlert',
-        type: 'string',
-        typeOptions: { password: true },
-        default: '',
-        displayOptions: { show: { operation: ['monitorAndAlert'], enableAI: [true] } },
-        description: 'Get one free at console.groq.com',
-      },
-
-      // ── Options ──────────────────────────────────────────────────────────
-      {
-        displayName: 'Options',
-        name: 'options',
-        type: 'collection',
-        placeholder: 'Add Option',
-        default: {},
-        options: [
-          {
-            displayName: 'Amazon Marketplace',
-            name: 'marketplace',
-            type: 'options',
-            default: 'amazon.com',
-            options: [
-              { name: 'Amazon US',  value: 'amazon.com' },
-              { name: 'Amazon UK',  value: 'amazon.co.uk' },
-              { name: 'Amazon DE',  value: 'amazon.de' },
-              { name: 'Amazon FR',  value: 'amazon.fr' },
-              { name: 'Amazon IN',  value: 'amazon.in' },
-              { name: 'Amazon CA',  value: 'amazon.ca' },
-              { name: 'Amazon JP',  value: 'amazon.co.jp' },
-              { name: 'Amazon AU',  value: 'amazon.com.au' },
-            ],
-          },
-          {
-            displayName: 'Batch Delay (ms)',
-            name: 'batchDelay',
-            type: 'number',
-            default: 10000,
-            displayOptions: { show: { '/operation': ['batchGetProducts'] } },
-          },
-          {
-            displayName: 'Request Timeout (ms)',
-            name: 'timeout',
-            type: 'number',
-            default: 30000,
-          },
-        ],
+        displayName:  'URL',
+        name:         'url',
+        type:         'string',
+        default:      '',
+        required:     true,
+        placeholder:  'https://example.com',
+        description:  'Any URL: regular page, sitemap.xml, or a Google/Bing/Amazon search URL.',
       },
     ],
   };
 
-  // ── Execute ───────────────────────────────────────────────────────────────
-
   async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
-    const items       = this.getInputData();
+    const items      = this.getInputData();
     const returnData: INodeExecutionData[] = [];
-    const credentials = await this.getCredentials('syphoonApi');
-    const apiKey      = credentials.apiKey as string;
+    const { apiKey } = await this.getCredentials('syphoonApi') as { apiKey: string };
 
     for (let i = 0; i < items.length; i++) {
-      const operation   = this.getNodeParameter('operation', i) as string;
-      const options     = this.getNodeParameter('options', i, {}) as IDataObject;
-      const marketplace = (options.marketplace as string) ?? 'amazon.com';
-      const timeout     = (options.timeout as number) ?? 30000;
-
+      const url = normalizeUrl(this.getNodeParameter('url', i) as string);
       try {
+        const html   = await syphoonFetch(this, apiKey, url, i);
+        const engine = detectSearchEngine(url);
 
-        // ── getProduct ──────────────────────────────────────────────────
-        if (operation === 'getProduct') {
-          const asin = extractAsin(this.getNodeParameter('asin', i) as string);
-          if (!asin) throw new NodeOperationError(this.getNode(), 'Invalid ASIN or URL', { itemIndex: i });
-          const html    = await syphoonRequest(this, apiKey, `https://www.${marketplace}/dp/${asin}`, timeout, i);
-          const product = parseProduct(html, asin);
+        const results = isSitemapUrl(url) ? await handleSitemap(this, apiKey, url, html, i)
+                      : engine !== null   ? await handleSerp(engine, url, html, i)
+                      :                    await handlePage(html, url, i);
 
-          // Track to DB silently
-          await trackToSyphoon(this, '/track/price', { asin, ...product }, apiKey);
-
-          returnData.push({ json: product, pairedItem: i });
-        }
-
-        // ── getProductIntelligence ──────────────────────────────────────
-        else if (operation === 'getProductIntelligence') {
-          const asin        = extractAsin(this.getNodeParameter('asin', i) as string);
-          if (!asin) throw new NodeOperationError(this.getNode(), 'Invalid ASIN or URL', { itemIndex: i });
-          const myPrice     = this.getNodeParameter('myPrice', i) as number;
-          const cost        = this.getNodeParameter('cost', i) as number;
-          const marginFloor = this.getNodeParameter('marginFloor', i) as number;
-          const html        = await syphoonRequest(this, apiKey, `https://www.${marketplace}/dp/${asin}`, timeout, i);
-          const product     = parseProduct(html, asin);
-          const enriched    = normalisePriceIntelligence(product, myPrice, cost, marginFloor);
-
-          // Save product + price snapshot
-          await trackToSyphoon(this, '/track/product', {
-            product: { asin, ...product, my_price: myPrice, cost, margin_floor: marginFloor },
-            competitors: [],
-          }, apiKey);
-          await trackToSyphoon(this, '/track/price', { asin, ...enriched }, apiKey);
-
-          returnData.push({ json: enriched, pairedItem: i });
-        }
-
-        // ── batchGetProducts ────────────────────────────────────────────
-        else if (operation === 'batchGetProducts') {
-          const rawAsins   = this.getNodeParameter('asins', i) as string;
-          const batchDelay = (options.batchDelay as number) ?? 10000;
-          const asinList   = rawAsins.split(',').map(a => extractAsin(a.trim())).filter((a): a is string => Boolean(a)).slice(0, 50);
-          if (!asinList.length) throw new NodeOperationError(this.getNode(), 'No valid ASINs found', { itemIndex: i });
-          for (let idx = 0; idx < asinList.length; idx++) {
-            const html    = await syphoonRequest(this, apiKey, `https://www.${marketplace}/dp/${asinList[idx]}`, timeout, i);
-            const product = parseProduct(html, asinList[idx]);
-            await trackToSyphoon(this, '/track/price', { asin: asinList[idx], ...product }, apiKey);
-            returnData.push({ json: product, pairedItem: i });
-            if (idx < asinList.length - 1) await sleep(batchDelay);
-          }
-        }
-
-        // ── autoDiscoverCompetitors — NO AI needed ──────────────────────
-        else if (operation === 'autoDiscoverCompetitors') {
-          const rawAsin     = this.getNodeParameter('asin', i) as string;
-          const asin        = extractAsin(rawAsin);
-          if (!asin) throw new NodeOperationError(this.getNode(), 'Invalid ASIN or URL', { itemIndex: i });
-          const myPrice     = this.getNodeParameter('myPrice', i) as number;
-          const cost        = this.getNodeParameter('cost', i) as number;
-          const marginFloor = this.getNodeParameter('marginFloor', i) as number;
-
-          // Step 1: fetch user's own product
-          const productHtml = await syphoonRequest(this, apiKey, `https://www.${marketplace}/dp/${asin}`, timeout, i);
-          const myProduct   = parseProduct(productHtml, asin);
-
-          if (!myProduct.title) {
-            throw new NodeOperationError(this.getNode(), `Could not extract title for ASIN ${asin}. Check the ASIN is valid.`, { itemIndex: i });
-          }
-
-          // Step 2: build search keyword automatically from title
-          const { keyword, weight } = buildSearchKeyword(
-            myProduct.title as string,
-            myProduct.brand as string | null,
-          );
-
-          // Step 3: search Amazon
-          const searchUrl  = `https://www.${marketplace}/s?k=${encodeURIComponent(keyword)}`;
-          const searchHtml = await syphoonRequest(this, apiKey, searchUrl, timeout, i);
-          const rawResults = parseSearchResults(searchHtml);
-
-          // Step 4: filter by weight match and exclude own ASIN
-          const competitors = rawResults.filter(r =>
-            r.asin !== asin &&
-            r.title &&
-            (!weight || matchesWeight(r.title as string, weight)),
-          );
-
-          // Step 5: save to DB
-          await trackToSyphoon(this, '/track/product', {
-            product: {
-              asin,
-              title:       myProduct.title,
-              brand:       myProduct.brand,
-              image_url:   myProduct.image_url,
-              product_url: myProduct.product_url,
-              my_price:    myPrice,
-              cost,
-              margin_floor: marginFloor,
-            },
-            competitors: competitors.map(c => ({
-              asin:        c.asin,
-              title:       c.title,
-              image_url:   c.image_url,
-              product_url: c.product_url,
-            })),
-          }, apiKey);
-
-          // Step 6: return each competitor
-          for (const c of competitors) {
-            returnData.push({
-              json: {
-                ...c,
-                my_product_asin:  asin,
-                my_product_title: myProduct.title,
-                search_keyword:   keyword,
-                weight_filter:    weight,
-                is_competitor:    true,
-              },
-              pairedItem: i,
-            });
-          }
-
-          if (!competitors.length) {
-            returnData.push({
-              json: {
-                my_product_asin: asin,
-                search_keyword:  keyword,
-                competitors:     [],
-                message:         `No competitors found matching weight "${weight}" for keyword "${keyword}"`,
-              },
-              pairedItem: i,
-            });
-          }
-        }
-
-        // ── discoverCompetitors — with Groq AI ──────────────────────────
-        else if (operation === 'discoverCompetitors') {
-          const keyword       = this.getNodeParameter('keyword', i) as string;
-          const myProductName = this.getNodeParameter('myProductName', i) as string;
-          const groqApiKey    = this.getNodeParameter('groqApiKey', i) as string;
-
-          const searchUrl = `https://www.${marketplace}/s?k=${encodeURIComponent(keyword)}`;
-          const html      = await syphoonRequest(this, apiKey, searchUrl, timeout, i);
-          const results   = parseSearchResults(html);
-
-          if (!results.length) {
-            returnData.push({ json: { keyword, competitors: [], ai_summary: 'No products found' }, pairedItem: i });
-            continue;
-          }
-
-          const productList = results.map((r, idx) =>
-            `${idx + 1}. ASIN: ${r.asin} | Title: ${r.title} | Price: $${r.price ?? 'N/A'}`,
-          ).join('\n');
-
-          const groqPrompt = `My product is: "${myProductName}"
-
-Here are Amazon search results for "${keyword}":
-${productList}
-
-Identify which of these are DIRECT competitors — must be a similar snack/food product, same category, similar weight/size, different brand. Exclude products that are clearly different (e.g. seasonings, garlic, spices if my product is chips).
-Return ONLY a JSON array of ASINs. No explanation, no markdown.
-Example: ["B07X41PWTY","B09B8RVKGM"]
-If none match, return [].`;
-
-          let competitorAsins: string[] = [];
-          try {
-            const groqRaw = await this.helpers.request({
-              method: 'POST',
-              url: 'https://api.groq.com/openai/v1/chat/completions',
-              headers: { 'Authorization': `Bearer ${groqApiKey}`, 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                model: 'llama-3.1-8b-instant',
-                max_tokens: 200,
-                temperature: 0.1,
-                messages: [
-                  { role: 'system', content: 'You are a product analyst. Return only valid JSON arrays, no explanation.' },
-                  { role: 'user',   content: groqPrompt },
-                ],
-              }),
-              timeout: 15000,
-            }) as string;
-            const parsed  = JSON.parse(groqRaw);
-            const content = parsed?.choices?.[0]?.message?.content ?? '[]';
-            competitorAsins = JSON.parse(content.replace(/```json|```/g, '').trim());
-          } catch {
-            competitorAsins = results.map(r => r.asin as string);
-          }
-
-          const competitors = results.filter(r => competitorAsins.includes(r.asin as string));
-
-          // Save to DB
-          await trackToSyphoon(this, '/track/product', {
-            product: { asin: null, title: myProductName },
-            competitors: competitors.map(c => ({ asin: c.asin, title: c.title, image_url: c.image_url })),
-          }, apiKey);
-
-          if (competitors.length) {
-            for (const c of competitors) {
-              returnData.push({ json: { ...c, keyword, my_product: myProductName, is_competitor: true }, pairedItem: i });
-            }
-          } else {
-            returnData.push({ json: { keyword, my_product: myProductName, competitors: [], message: 'AI found no direct competitors' }, pairedItem: i });
-          }
-        }
-
-        // ── monitorAndAlert ─────────────────────────────────────────────
-        else if (operation === 'monitorAndAlert') {
-          const asin         = extractAsin(this.getNodeParameter('asin', i) as string);
-          if (!asin) throw new NodeOperationError(this.getNode(), 'Invalid ASIN or URL', { itemIndex: i });
-          const myPrice      = this.getNodeParameter('myPrice', i) as number;
-          const cost         = this.getNodeParameter('cost', i) as number;
-          const marginFloor  = this.getNodeParameter('marginFloor', i) as number;
-          const alertChannel = this.getNodeParameter('alertChannel', i) as string;
-          const alertOnDrop  = this.getNodeParameter('alertOnDropOnly', i) as boolean;
-          const minUrgency   = this.getNodeParameter('minUrgency', i) as string;
-          const enableAI     = this.getNodeParameter('enableAI', i) as boolean;
-
-          const html     = await syphoonRequest(this, apiKey, `https://www.${marketplace}/dp/${asin}`, timeout, i);
-          const product  = parseProduct(html, asin);
-          const enriched = normalisePriceIntelligence(product, myPrice, cost, marginFloor) as IDataObject;
-
-          // AI recommendation (optional)
-          if (enableAI) {
-            const groqApiKeyAlert = this.getNodeParameter('groqApiKeyAlert', i) as string;
-            if (groqApiKeyAlert) {
-              try {
-                const groqRaw = await this.helpers.request({
-                  method: 'POST',
-                  url: 'https://api.groq.com/openai/v1/chat/completions',
-                  headers: { 'Authorization': `Bearer ${groqApiKeyAlert}`, 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    model: 'llama-3.1-8b-instant',
-                    max_tokens: 180,
-                    temperature: 0.5,
-                    messages: [
-                      { role: 'system', content: 'You are a sharp competitive pricing analyst. Give concise, actionable recommendations in 2 sentences max.' },
-                      { role: 'user', content: `Product: ${enriched.title}\nMy Price: $${enriched.my_price}\nCompetitor Price: $${enriched.current_price}\nGap: ${enriched.gap_pct}%\nRecommendation: ${enriched.recommendation}\nUrgency: ${enriched.urgency}\nMargin at competitor price: ${enriched.margin_at_competitor}%\nMin viable price: $${enriched.min_viable_price}\n\nGive a direct 2-sentence pricing recommendation.` },
-                    ],
-                  }),
-                  timeout: 15000,
-                }) as string;
-                const parsed = JSON.parse(groqRaw);
-                enriched.ai_recommendation = parsed?.choices?.[0]?.message?.content?.trim() ?? null;
-              } catch {
-                enriched.ai_recommendation = 'AI recommendation unavailable.';
-              }
-            }
-          }
-
-          // Alert logic
-          const urgencyOrder: Record<string, number> = { low: 0, medium: 1, high: 2, critical: 3 };
-          const currentLevel = urgencyOrder[enriched.urgency as string] ?? 0;
-          const minLevel     = urgencyOrder[minUrgency] ?? 2;
-          const shouldAlert  = alertOnDrop
-            ? (enriched.competitor_cheaper === true && currentLevel >= minLevel)
-            : true;
-
-          enriched.alert_sent    = shouldAlert;
-          enriched.alert_channel = alertChannel;
-
-          if (shouldAlert && alertChannel !== 'none') {
-            if (alertChannel === 'discord' || alertChannel === 'both') {
-              const webhook = this.getNodeParameter('discordWebhook', i) as string;
-              if (webhook) {
-                await this.helpers.request({
-                  method: 'POST', url: webhook,
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify(buildDiscordEmbed(enriched)),
-                  timeout: 10000,
-                });
-                enriched.discord_alert_sent = true;
-              }
-            }
-            if (alertChannel === 'telegram' || alertChannel === 'both') {
-              const token  = this.getNodeParameter('telegramToken', i) as string;
-              const chatId = this.getNodeParameter('telegramChatId', i) as string;
-              if (token && chatId) {
-                await this.helpers.request({
-                  method: 'POST',
-                  url: `https://api.telegram.org/bot${token}/sendMessage`,
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ chat_id: chatId, text: buildTelegramMessage(enriched), parse_mode: 'Markdown' }),
-                  timeout: 10000,
-                });
-                enriched.telegram_alert_sent = true;
-              }
-            }
-          }
-
-          // Track to DB silently
-          await trackToSyphoon(this, '/track/price', {
-            ...enriched,
-            alert_sent:    shouldAlert,
-            alert_channel: alertChannel,
-          }, apiKey);
-
-          returnData.push({ json: enriched, pairedItem: i });
-        }
-
+        returnData.push(...results);
       } catch (error) {
         if (this.continueOnFail()) {
-          returnData.push({ json: { error: (error as Error).message }, pairedItem: i });
+          returnData.push({ json: { url, error: (error as Error).message }, pairedItem: i });
           continue;
         }
         throw error;
@@ -886,46 +856,4 @@ If none match, return [].`;
 
     return [returnData];
   }
-}
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function extractAsin(input: string): string | null {
-  if (/^[A-Z0-9]{10}$/i.test(input.trim())) return input.trim().toUpperCase();
-  const m = input.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i);
-  return m ? m[1].toUpperCase() : null;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-async function syphoonRequest(
-  ctx: IExecuteFunctions,
-  apiKey: string,
-  url: string,
-  timeout: number,
-  itemIndex: number,
-): Promise<string> {
-  let response: IDataObject;
-  try {
-    response = await ctx.helpers.request({
-      method: 'POST',
-      url: 'https://api.syphoon.com/',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, key: apiKey, method: 'GET' }),
-      timeout,
-      resolveWithFullResponse: false,
-    }) as IDataObject;
-  } catch (err: unknown) {
-    const httpErr = err as { statusCode?: number; message?: string };
-    if (httpErr.statusCode === 402) throw new NodeOperationError(ctx.getNode(), 'Syphoon trial exhausted. Upgrade at https://app.syphoon.com/billing', { itemIndex });
-    if (httpErr.statusCode === 401 || httpErr.statusCode === 403) throw new NodeOperationError(ctx.getNode(), 'Invalid Syphoon API key. Check at https://app.syphoon.com/api-keys', { itemIndex });
-    if (httpErr.statusCode === 429) throw new NodeOperationError(ctx.getNode(), 'Syphoon rate limit hit. Increase delay or reduce polling frequency.', { itemIndex });
-    throw new NodeApiError(ctx.getNode(), err as JsonObject, { itemIndex });
-  }
-
-  if (typeof response === 'string') return response;
-  if (response.data && typeof response.data === 'string') return response.data;
-  throw new NodeOperationError(ctx.getNode(), `Unexpected response format from Syphoon for: ${url}`, { itemIndex });
 }
