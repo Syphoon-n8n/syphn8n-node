@@ -24,7 +24,9 @@
     "type": "git",
     "url": "https://github.com/Syphoon-n8n/syphn8n-node"
   },
-  "main": "index.js",
+
+  "main": "dist/index.js",
+"types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc && gulp build:icons",
     "dev": "tsc --watch",
