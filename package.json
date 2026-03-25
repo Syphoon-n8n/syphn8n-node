@@ -2,17 +2,17 @@
   "name": "n8n-nodes-syphoon",
   "version": "1.0.1",
   "description": "n8n community node for Syphoon - One-click web scraping node for n8n. Extract structured data from any webpage including product pages, listings, and dynamic content.",
-  "keywords": [
-    "n8n-community-node-package",
-    "n8n",
-    "scraper",
+"keywords": [
+  "n8n-community-node-package",
+  "n8n",
+  "scraper",
   "web-scraping",
   "automation",
   "generic-scraper",
   "data-extraction",
   "workflow-automation",
   "syphoon"
-  ],
+]
   "license": "MIT",
   "homepage": "https://syphoon.com",
   "author": {
