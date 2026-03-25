@@ -9,11 +9,11 @@ import {
   JsonObject,
 } from 'n8n-workflow';
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+
 
 const SYPHOON_TRACKING_URL = 'https://api.syphoon.com';
 
-// ─── HTML Helpers ─────────────────────────────────────────────────────────────
+
 
 function getText(html: string, re: RegExp, group = 1): string | null {
   const m = html.match(re);
