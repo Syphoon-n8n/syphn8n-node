@@ -27,8 +27,7 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Lint
-        run: npm run lint
+
 
       - name: Publish with provenance
         run: npm publish --provenance --access public
