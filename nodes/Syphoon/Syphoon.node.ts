@@ -13,9 +13,6 @@ import {
 
 const SYPHOON_API      = 'https://api.syphoon.com/';
 const FETCH_TIMEOUT_MS = 30_000;
-const RETRY_DELAY_MS   = 2_000;
-const PAGE_DELAY_MS    = 1_200;
-const RATE_LIMIT_DELAY = 5_000;
 const MAX_RETRIES      = 3;
 
 const USER_AGENTS = [
@@ -47,10 +44,6 @@ interface ScrapedOutput {
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
-
-const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
-const jitteredDelay = (base: number) =>
-  sleep(base + Math.floor((Math.random() - 0.5) * base * 0.6));
 
 function randomUA(): string {
   return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
@@ -280,7 +273,6 @@ function extractData(html: string, url: string): ScrapedOutput {
     jsonPriceNum ??
     null;
 
-  // Format price string: prefix currency code if no symbol present
   const priceFormatted = rawPrice
     ? (currency && !rawPrice.includes(currency) && !/[£$€¥₹]/.test(rawPrice)
         ? `${currency} ${rawPrice}`
@@ -314,8 +306,6 @@ function extractData(html: string, url: string): ScrapedOutput {
     (parseFloat(reGet(html, /class="[^"]*(?:rating|stars?)[^"]*"[^>]*>\s*([\d.]+)/i) ?? '') || null) ??
     null;
 
-  // Sanity check: valid ratings are between 1.5 and 5 on a 5-point scale
-  // Values of exactly 1 or below are almost always parsing errors
   const rating = (ratingRaw && !isNaN(ratingRaw) && ratingRaw >= 1.5 && ratingRaw <= 5)
     ? ratingRaw
     : null;
@@ -428,7 +418,6 @@ async function syphoonFetch(
   ctx: IExecuteFunctions, apiKey: string, url: string, itemIndex: number,
 ): Promise<string> {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    if (attempt > 0) await sleep(attempt * RETRY_DELAY_MS);
     try {
       const res = await ctx.helpers.request({
         method:  'POST',
@@ -447,7 +436,7 @@ async function syphoonFetch(
       const e = err as { statusCode?: number };
       if (e.statusCode === 402) throw new NodeOperationError(ctx.getNode(), 'Syphoon trial exhausted. Upgrade at syphoon.com.', { itemIndex });
       if (e.statusCode === 401 || e.statusCode === 403) throw new NodeOperationError(ctx.getNode(), 'Invalid Syphoon API key. Get your key at syphoon.com → Dashboard → API Keys.', { itemIndex });
-      if (e.statusCode === 429 && attempt < MAX_RETRIES) { await sleep(RATE_LIMIT_DELAY * (attempt + 1)); continue; }
+      if (e.statusCode === 429 && attempt < MAX_RETRIES) continue;
       if (attempt === MAX_RETRIES) throw new NodeApiError(ctx.getNode(), err as JsonObject, { itemIndex });
     }
   }
@@ -514,7 +503,6 @@ export class Syphoon implements INodeType {
         }
         throw error;
       }
-      if (i < items.length - 1) await jitteredDelay(PAGE_DELAY_MS);
     }
 
     return [returnData];
