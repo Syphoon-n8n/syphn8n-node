@@ -2,31 +2,39 @@
   "name": "n8n-nodes-syphoon",
   "version": "0.1.0",
   "description": "n8n community node for Syphoon - One-click web scraping node for n8n. Extract structured data from any webpage including product pages, listings, and dynamic content.",
-"keywords": [
-  "n8n-community-node-package",
-  "n8n",
-  "scraper",
-  "web-scraping",
-  "automation",
-  "generic-scraper",
-  "data-extraction",
-  "workflow-automation",
-  "syphoon"
-],
+  "keywords": [
+    "n8n-community-node-package",
+    "n8n",
+    "scraper",
+    "web-scraping",
+    "automation",
+    "generic-scraper",
+    "data-extraction",
+    "workflow-automation",
+    "syphoon"
+  ],
   "license": "MIT",
-  "homepage": "https://syphoon.com",
+  "homepage": "https://github.com/Syphoon-n8n/syphn8n-node",
   "author": {
     "name": "Syphoon",
     "email": "deepak@syphoon.com",
-    "url": "https://github.com/Syphoon-n8n/syphn8n-node"
+    "url": "https://github.com/Syphoon-n8n"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/Syphoon-n8n/syphn8n-node"
+    "url": "https://github.com/Syphoon-n8n/syphn8n-node.git"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+
+  "engines": {
+    "node": ">=18.0.0"
   },
 
-  "main": "dist/index.js",
-"types": "dist/index.d.ts",
+  "publishConfig": {
+    "access": "public"
+  },
+
   "scripts": {
     "build": "tsc && gulp build:icons",
     "dev": "tsc --watch",
@@ -36,9 +44,11 @@
     "prepublishOnly": "npm run build && npm run lint",
     "test": "jest"
   },
+
   "files": [
     "dist"
   ],
+
   "n8n": {
     "n8nNodesApiVersion": 1,
     "credentials": [
@@ -48,15 +58,18 @@
       "dist/nodes/Syphoon/Syphoon.node.js"
     ]
   },
+
   "devDependencies": {
     "@types/node": "^18.16.0",
     "@typescript-eslint/parser": "^5.60.0",
+    "eslint": "^8.57.0",
     "eslint-plugin-n8n-nodes-base": "^1.13.1",
     "gulp": "^4.0.2",
     "n8n-workflow": "^2.13.0",
     "prettier": "^2.8.8",
     "typescript": "^5.1.3"
   },
+
   "peerDependencies": {
     "n8n-workflow": "*"
   }
