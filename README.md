@@ -1,6 +1,6 @@
 # n8n-nodes-syphoon
 
-Generic web scraping node for n8n similar to ScrapingBee.
+Generic web scraping node for n8n 
 
 ## Features
 - Scrape any URL
