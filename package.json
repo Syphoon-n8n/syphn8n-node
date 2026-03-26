@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-syphoon",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "n8n community node for Syphoon - One-click web scraping node for n8n. Extract structured data from any webpage including product pages, listings, and dynamic content.",
   "keywords": [
     "n8n-community-node-package",
