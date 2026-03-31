@@ -14,16 +14,19 @@
     "syphoon"
   ],
   "license": "MIT",
+ 
+
   "homepage": "https://github.com/Syphoon-n8n/syphn8n-node",
-  "author": {
-    "name": "Syphoon",
-    "email": "deepak@syphoon.com",
-    "url": "https://github.com/Syphoon-n8n"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/Syphoon-n8n/syphn8n-node.git"
-  },
+"author": {
+  "name": "Syphoon",
+  "email": "deepak@syphoon.com",
+  "url": "https://syphoon.com"
+},
+"repository": {
+  "type": "git",
+  "url": "git+https://github.com/Syphoon-n8n/syphn8n-node.git"
+},
+  
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
 
