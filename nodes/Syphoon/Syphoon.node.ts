@@ -23,12 +23,60 @@ const USER_AGENTS = [
   'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
 ];
 
+// ─── Page type detection ──────────────────────────────────────────────────────
+
+type PageType =
+  | 'article'
+  | 'product'
+  | 'recipe'
+  | 'job'
+  | 'profile'
+  | 'video'
+  | 'event'
+  | 'real_estate'
+  | 'forum'
+  | 'documentation'
+  | 'generic';
+
 // ─── Output shape ─────────────────────────────────────────────────────────────
 
 interface ScrapedOutput {
-  url:           string;
-  source:        string;
-  scraped_at:    string;
+  // Universal fields — always populated when detectable
+  url:          string;
+  source:       string;
+  scraped_at:   string;
+  page_type:    PageType;
+
+  // Core content
+  title:        string | null;
+  description:  string | null;  // meta description / lead paragraph
+  body_text:    string | null;  // main readable content, stripped of nav/footer noise
+  author:       string | null;
+  published_at: string | null;
+  modified_at:  string | null;
+  language:     string | null;
+  images:       string[];       // all meaningful images found on page
+  links:        PageLink[];     // outbound links with anchor text
+
+  // Structured data — populated when schema.org blocks are present
+  schema_types: string[];       // e.g. ["Article", "BreadcrumbList"]
+  schema_raw:   IDataObject[];  // full parsed ld+json blocks for power users
+
+  // Type-specific enriched fields
+  // These are non-null only when the relevant page_type is detected
+  product:    ProductFields | null;
+  recipe:     RecipeFields  | null;
+  job:        JobFields     | null;
+  event:      EventFields   | null;
+  video:      VideoFields   | null;
+}
+
+interface PageLink {
+  url:  string;
+  text: string;
+}
+
+interface ProductFields {
   name:          string | null;
   brand:         string | null;
   sku:           string | null;
@@ -38,9 +86,53 @@ interface ScrapedOutput {
   availability:  string | null;
   rating:        number | null;
   review_count:  number | null;
-  images:        string[];
-  description:   string | null;
-  similar_urls:  string[];
+  category:      string | null;
+}
+
+interface RecipeFields {
+  name:            string | null;
+  cuisine:         string | null;
+  cook_time:       string | null;
+  prep_time:       string | null;
+  total_time:      string | null;
+  yield:           string | null;
+  ingredients:     string[];
+  instructions:    string[];
+  rating:          number | null;
+  review_count:    number | null;
+  calories:        string | null;
+}
+
+interface JobFields {
+  title:            string | null;
+  company:          string | null;
+  location:         string | null;
+  employment_type:  string | null;
+  remote:           boolean | null;
+  salary:           string | null;
+  date_posted:      string | null;
+  valid_through:    string | null;
+  description:      string | null;
+}
+
+interface EventFields {
+  name:        string | null;
+  start_date:  string | null;
+  end_date:    string | null;
+  location:    string | null;
+  organizer:   string | null;
+  price:       string | null;
+  status:      string | null;
+}
+
+interface VideoFields {
+  name:         string | null;
+  duration:     string | null;
+  upload_date:  string | null;
+  thumbnail:    string | null;
+  embed_url:    string | null;
+  channel:      string | null;
+  view_count:   number | null;
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
@@ -62,14 +154,32 @@ function getOrigin(url: string): string {
   try { return new URL(url).origin; } catch { return url; }
 }
 
+function resolveUrl(href: string, base: string): string | null {
+  try {
+    return new URL(href, base).href;
+  } catch { return null; }
+}
+
+/**
+ * Strip HTML tags, collapse whitespace.
+ * Converts block elements to newlines so prose structure is preserved.
+ */
 function stripHtml(html: string): string {
   return html
     .replace(/<script[\s\S]*?<\/script>/gi, '')
     .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
-    .replace(/\s+/g, ' ').trim();
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
+    // Block-level tags → newline
+    .replace(/<\/?(p|div|section|article|aside|header|footer|h[1-6]|li|tr|blockquote|pre|br)[^>]*>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    // HTML entities
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    // Collapse whitespace but keep paragraph breaks
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 function reGet(html: string, re: RegExp): string | null {
@@ -78,24 +188,31 @@ function reGet(html: string, re: RegExp): string | null {
   return (m[1] ?? m[2] ?? m[3])?.trim() ?? null;
 }
 
-function truncate(s: string | null, max = 1000): string | null {
+function truncate(s: string | null, max = 2000): string | null {
   if (!s) return null;
+  s = s.trim();
   return s.length > max ? s.slice(0, max) + '...' : s;
 }
 
-function isAmazonUrl(url: string): boolean {
-  return /amazon\.(com|co\.uk|in|de|fr|ca|com\.au|co\.jp)/.test(url);
+function coerceString(v: unknown): string | null {
+  if (v == null) return null;
+  const s = String(v).trim();
+  return s || null;
 }
 
-function isProductImage(src: string): boolean {
-  return (
-    /\.(jpg|jpeg|png|webp|avif)(\?|$)/i.test(src) &&
-    !/sprite|icon|logo|badge|pixel|blank|spacer|nav|header|footer|tracking/i.test(src) &&
-    !src.startsWith('data:')
-  );
+function coerceNumber(v: unknown): number | null {
+  if (v == null) return null;
+  const n = parseFloat(String(v));
+  return isNaN(n) ? null : n;
 }
 
-// ─── Schema.org ───────────────────────────────────────────────────────────────
+function coerceInt(v: unknown): number | null {
+  if (v == null) return null;
+  const n = parseInt(String(v).replace(/[^0-9]/g, ''), 10);
+  return isNaN(n) ? null : n;
+}
+
+// ─── Schema.org parsing ───────────────────────────────────────────────────────
 
 function extractStructuredData(html: string): IDataObject[] {
   const blocks: IDataObject[] = [];
@@ -111,304 +228,563 @@ function extractStructuredData(html: string): IDataObject[] {
   return blocks;
 }
 
-function findProductSchema(blocks: IDataObject[]): IDataObject | null {
-  const direct = blocks.find(b =>
-    ((b['@type'] as string | undefined) ?? '').toLowerCase() === 'product'
-  );
-  if (direct) return direct;
-  for (const block of blocks) {
-    const graph = block['@graph'];
-    if (Array.isArray(graph)) {
-      const found = (graph as IDataObject[]).find(b =>
-        ((b['@type'] as string | undefined) ?? '').toLowerCase() === 'product'
-      );
-      if (found) return found;
-    }
-    if (Array.isArray(block)) {
-      const found = (block as unknown as IDataObject[]).find(b =>
-        ((b['@type'] as string | undefined) ?? '').toLowerCase() === 'product'
-      );
-      if (found) return found;
+/** Flatten @graph arrays and normalize to a flat list of typed schema blocks */
+function flattenSchemaBlocks(blocks: IDataObject[]): IDataObject[] {
+  const flat: IDataObject[] = [];
+  for (const b of blocks) {
+    if (Array.isArray(b['@graph'])) {
+      flat.push(...(b['@graph'] as IDataObject[]));
+    } else {
+      flat.push(b);
     }
   }
+  return flat;
+}
+
+function findSchemaByType(blocks: IDataObject[], ...types: string[]): IDataObject | null {
+  const typeSet = new Set(types.map(t => t.toLowerCase()));
+  return blocks.find(b => {
+    const t = b['@type'];
+    if (typeof t === 'string') return typeSet.has(t.toLowerCase());
+    if (Array.isArray(t)) return (t as string[]).some(x => typeSet.has(x.toLowerCase()));
+    return false;
+  }) ?? null;
+}
+
+function schemaTypes(blocks: IDataObject[]): string[] {
+  const seen = new Set<string>();
+  for (const b of blocks) {
+    const t = b['@type'];
+    if (typeof t === 'string' && t) seen.add(t);
+    if (Array.isArray(t)) (t as string[]).forEach(x => x && seen.add(x));
+  }
+  return [...seen];
+}
+
+// ─── Page type detection ──────────────────────────────────────────────────────
+
+function detectPageType(html: string, url: string, schemaBlocks: IDataObject[]): PageType {
+  const types = schemaTypes(schemaBlocks).map(t => t.toLowerCase());
+
+  // Schema.org is the most reliable signal
+  if (types.includes('product') || types.includes('offer')) return 'product';
+  if (types.includes('recipe')) return 'recipe';
+  if (types.includes('jobposting')) return 'job';
+  if (types.includes('event') || types.includes('businessevent') || types.includes('socialevent')) return 'event';
+  if (types.includes('videoobject')) return 'video';
+  if (types.some(t => ['article', 'newsarticle', 'blogposting', 'reportage', 'webpage'].includes(t))) return 'article';
+  if (types.some(t => ['person', 'profilepage'].includes(t))) return 'profile';
+
+  // URL heuristics
+  const path = url.toLowerCase();
+  if (/\/(recipe|recipes?)\//i.test(path)) return 'recipe';
+  if (/\/(job|jobs|careers?|position|vacancy|vacancies)\//i.test(path)) return 'job';
+  if (/\/(event|events?|conference|meetup)\//i.test(path)) return 'event';
+  if (/\/(watch|video|videos?)\//i.test(path) || /youtube\.com|vimeo\.com/.test(path)) return 'video';
+  if (/\/(property|listing|rent|buy|apartment|house|flat)\//i.test(path)) return 'real_estate';
+  if (/\/(forum|community|thread|discussion|topic|post)\//i.test(path)) return 'forum';
+  if (/\/(docs?|documentation|guide|reference|manual|api)\//i.test(path)) return 'documentation';
+  if (
+    /\/(dp|product|item|sku|p\/[a-z0-9-]+|shop)\//i.test(path) ||
+    /amazon\.|flipkart\.|ebay\.|etsy\./.test(path)
+  ) return 'product';
+
+  // HTML content signals
+  if (/itemprop=["']recipeIngredient/i.test(html)) return 'recipe';
+  if (/itemprop=["']hiringOrganization/i.test(html)) return 'job';
+  if (
+    /<article[\s>]/i.test(html) &&
+    /(?:byline|author|published|dateline)/i.test(html)
+  ) return 'article';
+
+  return 'generic';
+}
+
+// ─── Open Graph & meta helpers ────────────────────────────────────────────────
+
+interface MetaData {
+  og:   Record<string, string>;
+  meta: Record<string, string>;
+}
+
+function extractMeta(html: string): MetaData {
+  const og: Record<string, string>   = {};
+  const meta: Record<string, string> = {};
+
+  const ogRe = /<meta[^>]+property=["'](og:[^"']+)["'][^>]+content=["']([^"']*)["'][^>]*\/?>/gi;
+  let m;
+  while ((m = ogRe.exec(html)) !== null) og[m[1].replace('og:', '')] = m[2];
+
+  const metaRe = /<meta[^>]+name=["']([^"']+)["'][^>]+content=["']([^"']*)["'][^>]*\/?>/gi;
+  while ((m = metaRe.exec(html)) !== null) meta[m[1].toLowerCase()] = m[2];
+
+  return { og, meta };
+}
+
+// ─── Core content extraction ──────────────────────────────────────────────────
+
+/**
+ * Extract the main readable body text from a page.
+ * Strategy: find the largest block of prose text, stripping nav/header/footer/sidebar noise.
+ */
+function extractBodyText(html: string): string | null {
+  // Remove clearly non-content regions
+  let cleaned = html
+    .replace(/<(nav|header|footer|aside|script|style|noscript|iframe|form|svg)[^>]*>[\s\S]*?<\/\1>/gi, '')
+    .replace(/<!--[\s\S]*?-->/g, '');
+
+  // Prefer semantic main content containers
+  const candidates = [
+    /<main[^>]*>([\s\S]*?)<\/main>/i,
+    /<article[^>]*>([\s\S]*?)<\/article>/i,
+    /id=["'](?:content|main|article|post|entry|body|story|text)[^"']*["'][^>]*>([\s\S]*?)<\/(?:div|section|article)>/i,
+    /class=["'][^"']*(?:content|article|post|entry|story|body|prose)[^"']*["'][^>]*>([\s\S]*?)<\/(?:div|section|article)>/i,
+  ];
+
+  let best: string | null = null;
+  for (const re of candidates) {
+    const match = re.exec(cleaned);
+    if (match && match[1] && match[1].length > (best?.length ?? 0)) {
+      best = match[1];
+    }
+  }
+
+  const source = best ?? cleaned;
+  const text   = stripHtml(source);
+
+  // Require at least 100 chars of real content
+  return text.length >= 100 ? truncate(text, 5000) : null;
+}
+
+function extractTitle(html: string, og: Record<string, string>, meta: Record<string, string>): string | null {
+  // Priority: og:title > <title> > <h1>
+  if (og['title']) return og['title'].trim();
+
+  const titleTag = reGet(html, /<title[^>]*>([\s\S]{1,300}?)<\/title>/i);
+  if (titleTag) {
+    const stripped = stripHtml(titleTag);
+    // Strip common site-name suffixes: "Article Title | Site Name"
+    const cleaned = stripped.split(/\s+[|\-–—]\s+/)[0].trim();
+    if (cleaned.length >= 3) return cleaned;
+  }
+
+  const h1 = reGet(html, /<h1[^>]*>([\s\S]{1,300}?)<\/h1>/i);
+  if (h1) return stripHtml(h1).trim() || null;
+
+  if (meta['title']) return meta['title'].trim();
+
   return null;
 }
 
-// ─── Amazon image extractor ───────────────────────────────────────────────────
-
-function extractAmazonImages(html: string): string[] {
-  const images = new Set<string>();
-  const colorM = html.match(/'colorImages'\s*:\s*\{[^}]*'initial'\s*:\s*(\[[\s\S]*?\])\s*\}/);
-  if (colorM) {
-    try {
-      const arr = JSON.parse(colorM[1]) as Array<{ hiRes?: string; large?: string }>;
-      for (const img of arr) {
-        const src = img.hiRes ?? img.large;
-        if (src && typeof src === 'string' && isProductImage(src)) images.add(src);
-      }
-    } catch { /* fallback */ }
-  }
-  if (images.size === 0) {
-    const re = /https:\/\/m\.media-amazon\.com\/images\/I\/([A-Za-z0-9%-]+\.(jpg|jpeg|png|webp))/gi;
-    let m;
-    while ((m = re.exec(html)) !== null) {
-      if (!/_SX\d+_|_SY\d+_|_CR,|sprites/.test(m[0])) images.add(m[0]);
+function extractAuthor(html: string, schemaBlocks: IDataObject[], og: Record<string, string>, meta: Record<string, string>): string | null {
+  // Schema.org author (Article or Person)
+  const article = findSchemaByType(schemaBlocks, 'Article', 'NewsArticle', 'BlogPosting', 'Reportage');
+  if (article) {
+    const a = article['author'] as IDataObject | string | undefined;
+    if (a) {
+      const name = typeof a === 'object' ? coerceString((a as IDataObject)['name']) : coerceString(a);
+      if (name) return name;
     }
   }
-  return [...images].slice(0, 10);
+
+  // Meta tags
+  if (meta['author']) return meta['author'];
+  if (meta['article:author']) return meta['article:author'];
+  if (og['article:author']) return og['article:author'];
+
+  // Common HTML patterns
+  return (
+    reGet(html, /itemprop=["']author["'][^>]*>\s*(?:<[^>]+>)?\s*([A-Z][^<]{2,60})/) ??
+    reGet(html, /class=["'][^"']*(?:byline|author|byline__name)[^"']*["'][^>]*>\s*(?:<[^>]+>)?\s*([A-Z][^<]{2,60})/) ??
+    reGet(html, /rel=["']author["'][^>]*>\s*([^<]{2,60})/) ??
+    null
+  );
 }
 
-// ─── Universal extractor ──────────────────────────────────────────────────────
+function extractDates(html: string, schemaBlocks: IDataObject[], meta: Record<string, string>): { published: string | null; modified: string | null } {
+  const article = findSchemaByType(schemaBlocks, 'Article', 'NewsArticle', 'BlogPosting', 'WebPage');
 
-function extractData(html: string, url: string): ScrapedOutput {
-  const source    = hostname(url);
-  const isAmazon  = isAmazonUrl(url);
-  const ldBlocks  = extractStructuredData(html);
-  const ldProduct = findProductSchema(ldBlocks);
-
-  // ── Open Graph ────────────────────────────────────────────────────────────
-  const og: Record<string, string> = {};
-  const ogRe = /<meta[^>]+property=["'](og:[^"']+)["'][^>]+content=["']([^"']*)["']/gi;
-  let ogM;
-  while ((ogM = ogRe.exec(html)) !== null) og[ogM[1].replace('og:', '')] = ogM[2];
-
-  // ── Name ──────────────────────────────────────────────────────────────────
-  const h1    = reGet(html, /<h1[^>]*>([\s\S]{1,300}?)<\/h1>/i);
-  const title = reGet(html, /<title[^>]*>([\s\S]{1,200}?)<\/title>/i);
-  const name  =
-    (ldProduct?.['name'] != null ? String(ldProduct['name']) : null) ??
-    og['title'] ??
-    (h1 ? stripHtml(h1).trim() : null) ??
-    (title ? stripHtml(title).split(/[|\-–—]/)[0].trim() : null) ??
+  const published =
+    coerceString(article?.['datePublished']) ??
+    meta['article:published_time'] ??
+    meta['date'] ??
+    meta['pubdate'] ??
+    reGet(html, /itemprop=["']datePublished["'][^>]*(?:content=["']([^"']+)["']|>\s*([^<]{4,30}))/) ??
+    reGet(html, /<time[^>]+datetime=["']([^"']+)["']/) ??
     null;
 
-  // ── Brand ─────────────────────────────────────────────────────────────────
-  const ldBrand   = ldProduct?.['brand'] as IDataObject | string | undefined;
-  const brandName = ldBrand != null
-    ? (typeof ldBrand === 'object'
-        ? String((ldBrand as IDataObject)['name'] ?? '')
-        : String(ldBrand))
-    : null;
-  const brand =
-    brandName ??
-    (isAmazon
-      ? (reGet(html, /id=["']bylineInfo["'][^>]*>[\s\S]*?<[^>]*>\s*([^<]{2,80})/) ??
-         reGet(html, /id=["']bylineInfo["'][^>]*>\s*(?:Brand:|by\s+)([^<\n]{2,60})/))
-      : null) ??
-    reGet(html, /(?:itemprop=["']brand["']|class="[^"]*brand[^"]*")[^>]*>\s*([^<]{2,80})/) ??
-    reGet(html, /<meta[^>]+name=["']author["'][^>]+content=["']([^"']+)["']/i) ??
+  const modified =
+    coerceString(article?.['dateModified']) ??
+    meta['article:modified_time'] ??
+    reGet(html, /itemprop=["']dateModified["'][^>]*content=["']([^"']+)["']/) ??
     null;
 
-  // ── SKU ───────────────────────────────────────────────────────────────────
-  const urlSku =
-    url.match(/\/(?:rooms?|dp|p|item|product|listing|gp\/product|itm)\/([A-Za-z0-9_-]{4,})/)?.[1] ??
-    url.match(/[?&](?:id|pid|item_id|listing_id|product_id)=([A-Za-z0-9_-]+)/)?.[1] ??
-    null;
-  const sku =
-    (ldProduct?.['sku']       != null ? String(ldProduct['sku'])       : null) ??
-    (ldProduct?.['mpn']       != null ? String(ldProduct['mpn'])       : null) ??
-    (ldProduct?.['productID'] != null ? String(ldProduct['productID']) : null) ??
-    reGet(html, /itemprop=["'](?:sku|mpn|productID)["'][^>]*content=["']([^"']+)["']/i) ??
-    (isAmazon
-      ? (url.match(/\/(?:dp|product|gp\/product)\/([A-Z0-9]{10})/)?.[1] ??
-         reGet(html, /"ASIN"\s*:\s*"([A-Z0-9]{10})"/))
-      : null) ??
-    urlSku ??
-    null;
+  return { published, modified };
+}
 
-  // ── Price ─────────────────────────────────────────────────────────────────
-  const ldOffers = ldProduct?.['offers'] as IDataObject | IDataObject[] | undefined;
-  const ldOffer  = Array.isArray(ldOffers) ? ldOffers[0] : ldOffers;
+function extractLanguage(html: string): string | null {
+  return (
+    reGet(html, /<html[^>]+lang=["']([^"']+)["']/) ??
+    reGet(html, /<meta[^>]+http-equiv=["']Content-Language["'][^>]+content=["']([^"']+)["']/) ??
+    null
+  );
+}
 
-  const jsonPriceStr =
-    html.match(/"price_string"\s*:\s*"([^"]+)"/)?.[1] ??
-    html.match(/"displayPrice"\s*:\s*"([^"]+)"/)?.[1] ??
-    html.match(/"formattedPrice"\s*:\s*"([^"]+)"/)?.[1] ??
-    html.match(/"price"\s*:\s*"([£$€¥₹][^"]{1,20})"/)?.[1] ??
-    null;
+function extractImages(html: string, url: string): string[] {
+  const seen    = new Set<string>();
+  const results: string[] = [];
+  const origin  = getOrigin(url);
 
-  const jsonPriceNum =
-    (parseFloat(html.match(/"amount"\s*:\s*([\d.]+)/)?.[1] ?? '') || null) ??
-    (parseFloat(html.match(/"price"\s*:\s*([\d.]+)/)?.[1] ?? '') || null) ??
-    null;
-
-  const currencyStr =
-    (ldOffer?.['priceCurrency'] != null ? String(ldOffer['priceCurrency']) : null) ??
-    html.match(/"currency"\s*:\s*"([A-Z]{3})"/)?.[1] ??
-    html.match(/"priceCurrency"\s*:\s*"([A-Z]{3})"/)?.[1] ??
-    null;
-
-  let amazonPrice: string | null = null;
-  if (isAmazon) {
-    const wholeM = html.match(/class="a-price-whole"[^>]*>\s*([\d,]+)\s*</);
-    const fracM  = html.match(/class="a-price-fraction"[^>]*>\s*(\d{2})\s*</);
-    if (wholeM) {
-      const whole = wholeM[1].replace(/,/g, '');
-      const frac  = fracM?.[1] ?? '00';
-      amazonPrice = `$${whole}.${frac}`;
-    }
-    if (!amazonPrice) {
-      const dp = reGet(html, /data-a-price=["']([\d.]+)["']/);
-      if (dp) amazonPrice = `$${dp}`;
+  function add(src: string | null | undefined) {
+    if (!src) return;
+    src = src.trim();
+    if (src.startsWith('data:')) return;
+    const resolved = src.startsWith('http') ? src : resolveUrl(src, origin);
+    if (!resolved) return;
+    // Skip tiny tracking/spacer images and clearly non-content URLs
+    if (/\/(pixel|tracking|beacon|spacer|blank|1x1)\b/i.test(resolved)) return;
+    if (/\.(ico|svg)(\?|$)/i.test(resolved)) return;
+    if (!seen.has(resolved)) {
+      seen.add(resolved);
+      results.push(resolved);
     }
   }
 
-  const rawPrice: string | null =
-    amazonPrice ??
-    (ldOffer?.['price'] != null ? String(ldOffer['price']) : null) ??
-    jsonPriceStr ??
+  // 1. og:image — usually the best representative image
+  const ogImg = reGet(html, /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i);
+  add(ogImg);
+
+  // 2. Twitter card image
+  const twImg = reGet(html, /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i);
+  add(twImg);
+
+  // 3. Schema.org image
+  const blocks = flattenSchemaBlocks(extractStructuredData(html));
+  for (const block of blocks) {
+    const img = block['image'] as string | string[] | IDataObject | undefined;
+    if (typeof img === 'string') add(img);
+    else if (Array.isArray(img)) (img as string[]).forEach(add);
+    else if (img && typeof img === 'object') {
+      add(coerceString((img as IDataObject)['url']));
+    }
+  }
+
+  // 4. Scan <img> tags — gather up to 20 meaningful images
+  const re = /<img[^>]+(?:src|data-src|data-lazy-src|data-original)=["']([^"']+)["']/gi;
+  let m;
+  while ((m = re.exec(html)) !== null && results.length < 20) {
+    add(m[1]);
+  }
+
+  // 5. Background images in inline styles (common for hero sections)
+  const bgRe = /background(?:-image)?:\s*url\(['"]?([^'")\s]+)['"]?\)/gi;
+  while ((m = bgRe.exec(html)) !== null && results.length < 20) {
+    add(m[1]);
+  }
+
+  return results.slice(0, 20);
+}
+
+function extractLinks(html: string, baseUrl: string): PageLink[] {
+  const origin  = getOrigin(baseUrl);
+  const seen    = new Set<string>();
+  const results: PageLink[] = [];
+
+  const NOISE_PATTERNS = /\/(login|logout|signin|signup|register|cart|checkout|account|wishlist|search|sitemap|privacy|terms|contact|about|subscribe|unsubscribe)\b|\.(css|js|xml|rss|atom|json|pdf|zip)(\?|$)/i;
+
+  const re = /<a[^>]+href=["']([^"'#]+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null && results.length < 50) {
+    const href = m[1].trim();
+    if (!href) continue;
+    const resolved = href.startsWith('http') ? href : resolveUrl(href, origin);
+    if (!resolved) continue;
+    if (NOISE_PATTERNS.test(resolved)) continue;
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+    const text = stripHtml(m[2]).slice(0, 100).trim();
+    if (!text) continue;
+    results.push({ url: resolved, text });
+  }
+
+  return results;
+}
+
+// ─── Type-specific field extractors ──────────────────────────────────────────
+
+function extractProductFields(html: string, url: string, schemaBlocks: IDataObject[]): ProductFields {
+  const ldProduct = findSchemaByType(schemaBlocks, 'Product');
+  const ldOffers  = ldProduct?.['offers'] as IDataObject | IDataObject[] | undefined;
+  const ldOffer   = Array.isArray(ldOffers) ? ldOffers[0] : ldOffers;
+  const { og, meta } = extractMeta(html);
+
+  // Name
+  const name =
+    coerceString(ldProduct?.['name']) ??
+    og['title'] ??
+    reGet(html, /<h1[^>]*>([\s\S]{1,200}?)<\/h1>/i)?.replace(/<[^>]+>/g, '').trim() ??
+    null;
+
+  // Brand
+  const ldBrand = ldProduct?.['brand'] as IDataObject | string | undefined;
+  const brand =
+    (ldBrand ? (typeof ldBrand === 'object' ? coerceString((ldBrand as IDataObject)['name']) : coerceString(ldBrand)) : null) ??
+    reGet(html, /itemprop=["']brand["'][^>]*>[\s\S]*?itemprop=["']name["'][^>]*content=["']([^"']+)["']/) ??
+    reGet(html, /itemprop=["']brand["'][^>]*>\s*<[^>]+>\s*([^<]{2,80})/) ??
+    meta['author'] ??
+    null;
+
+  // SKU
+  const sku =
+    coerceString(ldProduct?.['sku']) ??
+    coerceString(ldProduct?.['mpn']) ??
+    coerceString(ldProduct?.['productID']) ??
+    reGet(html, /itemprop=["'](?:sku|mpn|productID)["'][^>]*content=["']([^"']+)["']/i) ??
+    url.match(/\/(?:dp|product|gp\/product)\/([A-Z0-9]{10})/)?.[1] ??
+    null;
+
+  // Price
+  const rawPrice =
+    coerceString(ldOffer?.['price']) ??
     reGet(html, /itemprop=["']price["'][^>]*content=["']([^"']+)["']/i) ??
-    reGet(html, /itemprop=["']price["'][^>]*>\s*([£$€¥₹][\d,.]+)/) ??
-    reGet(html, /class="[^"]*(?:price|rate|cost|fare)[^"]*"[^>]*>\s*([£$€¥₹][\d,. ]+)/) ??
+    reGet(html, /itemprop=["']price["'][^>]*>\s*([£$€¥₹]?[\d,. ]+)/) ??
+    reGet(html, /class=["'][^"']*(?:price|rate|cost|fare)[^"']*["'][^>]*>\s*([£$€¥₹][\d,.]+)/) ??
     null;
 
   const currency =
-    currencyStr ??
-    (rawPrice?.match(/[£$€¥₹]/)?.[0] ?? null) ??
+    coerceString(ldOffer?.['priceCurrency']) ??
     reGet(html, /itemprop=["']priceCurrency["'][^>]*content=["']([^"']+)["']/i) ??
+    rawPrice?.match(/[£$€¥₹]/)?.[0] ??
     null;
 
-  const priceNumeric =
-    (rawPrice ? (parseFloat(rawPrice.replace(/[^0-9.]/g, '')) || null) : null) ??
-    jsonPriceNum ??
-    null;
+  const price_numeric = rawPrice ? (parseFloat(rawPrice.replace(/[^0-9.]/g, '')) || null) : null;
+  const price = rawPrice
+    ? (currency && !rawPrice.includes(currency) && !/[£$€¥₹]/.test(rawPrice) ? `${currency} ${rawPrice}` : rawPrice)
+    : null;
 
-  const priceFormatted = rawPrice
-    ? (currency && !rawPrice.includes(currency) && !/[£$€¥₹]/.test(rawPrice)
-        ? `${currency} ${rawPrice}`
-        : rawPrice)
-    : (priceNumeric ? String(priceNumeric) : null);
-
-  // ── Availability ──────────────────────────────────────────────────────────
+  // Availability
   const availRaw =
-    (ldOffer?.['availability'] != null ? String(ldOffer['availability']) : null) ??
+    coerceString(ldOffer?.['availability']) ??
     reGet(html, /itemprop=["']availability["'][^>]*content=["']([^"']+)["']/i) ??
     null;
-
   const availability = availRaw
-    ? (availRaw.toLowerCase().includes('instock') || availRaw.toLowerCase().includes('available')
-        ? 'Available' : 'Unavailable')
-    : html.match(/\b(in stock|available now|book now|reserve now|add to cart|buy now)\b/i)
-        ? 'Available'
-    : html.match(/\b(out of stock|sold out|unavailable|fully booked|not available)\b/i)
-        ? 'Unavailable'
+    ? (/instock|available/i.test(availRaw) ? 'Available' : 'Unavailable')
+    : /\b(in stock|available now|add to cart|buy now)\b/i.test(html) ? 'Available'
+    : /\b(out of stock|sold out|unavailable)\b/i.test(html) ? 'Unavailable'
     : null;
 
-  // ── Rating ────────────────────────────────────────────────────────────────
+  // Rating
   const ldAgg = ldProduct?.['aggregateRating'] as IDataObject | undefined;
-
   const ratingRaw =
-    (ldAgg?.['ratingValue'] != null ? parseFloat(String(ldAgg['ratingValue'])) : null) ??
-    (parseFloat(reGet(html, /itemprop=["']ratingValue["'][^>]*content=["']([^"']+)["']/i) ?? '') || null) ??
-    (parseFloat(reGet(html, /"ratingValue"\s*:\s*([\d.]+)/) ?? '') || null) ??
-    (parseFloat(reGet(html, /"rating"\s*:\s*([\d.]+)/) ?? '') || null) ??
-    (parseFloat(reGet(html, /(\d\.\d)\s+out of 5/) ?? '') || null) ??
-    (parseFloat(reGet(html, /class="[^"]*(?:rating|stars?)[^"]*"[^>]*>\s*([\d.]+)/i) ?? '') || null) ??
+    coerceNumber(ldAgg?.['ratingValue']) ??
+    coerceNumber(reGet(html, /itemprop=["']ratingValue["'][^>]*content=["']([^"']+)["']/i)) ??
+    coerceNumber(reGet(html, /(\d\.\d)\s+out of 5/)) ??
+    null;
+  const rating = ratingRaw && ratingRaw >= 1 && ratingRaw <= 5 ? ratingRaw : null;
+
+  const review_count =
+    coerceInt(ldAgg?.['reviewCount']) ??
+    coerceInt(ldAgg?.['ratingCount']) ??
+    coerceInt(reGet(html, /([\d,]+)\s+(?:reviews?|ratings?)/i)) ??
     null;
 
-  const rating = (ratingRaw && !isNaN(ratingRaw) && ratingRaw >= 1.5 && ratingRaw <= 5)
-    ? ratingRaw
-    : null;
-
-  // ── Review count ──────────────────────────────────────────────────────────
-  const reviewRaw =
-    (ldAgg?.['reviewCount'] != null ? parseInt(String(ldAgg['reviewCount']), 10) : null) ??
-    (ldAgg?.['ratingCount']  != null ? parseInt(String(ldAgg['ratingCount']),  10) : null) ??
-    (parseInt((reGet(html, /itemprop=["']reviewCount["'][^>]*content=["']([^"']+)["']/i) ?? '').replace(/[^0-9]/g, ''), 10) || null) ??
-    (parseInt((reGet(html, /([\d,]+)\s+(?:reviews?|ratings?|opinions?)/i) ?? '').replace(/[^0-9]/g, ''), 10) || null) ??
+  // Category
+  const category =
+    coerceString(ldProduct?.['category']) ??
+    coerceString(ldProduct?.['breadcrumb']) ??
     null;
 
-  const review_count = (reviewRaw && !isNaN(reviewRaw)) ? reviewRaw : null;
+  return { name, brand, sku, price, price_numeric, currency, availability, rating, review_count, category };
+}
 
-  // ── Images ────────────────────────────────────────────────────────────────
-  const imgSet = new Set<string>();
+function extractRecipeFields(html: string, schemaBlocks: IDataObject[]): RecipeFields {
+  const ld = findSchemaByType(schemaBlocks, 'Recipe');
 
-  if (isAmazon) {
-    for (const src of extractAmazonImages(html)) imgSet.add(src);
-  }
+  const extractList = (val: unknown): string[] => {
+    if (!val) return [];
+    if (Array.isArray(val)) return (val as unknown[]).map(v => {
+      if (typeof v === 'string') return stripHtml(v).trim();
+      const o = v as IDataObject;
+      return stripHtml(coerceString(o['text'] ?? o['name'] ?? o['itemListElement']) ?? '').trim();
+    }).filter(Boolean);
+    if (typeof val === 'string') return [stripHtml(val).trim()].filter(Boolean);
+    return [];
+  };
 
-  if (imgSet.size === 0) {
-    const ldImages = ldProduct?.['image'] as string[] | string | undefined;
-    const schemaImgs: string[] = Array.isArray(ldImages)
-      ? ldImages.filter(isProductImage).slice(0, 10)
-      : ldImages && isProductImage(ldImages) ? [ldImages] : [];
-    for (const s of schemaImgs) imgSet.add(s);
-  }
-
-  if (og['image'] && isProductImage(og['image'])) imgSet.add(og['image']);
-
-  if (imgSet.size < 5) {
-    const re = /<img[^>]+src=["']([^"']+)["']/gi;
+  // Fallback: scrape itemprop lists from HTML
+  const scrapeItemProp = (prop: string): string[] => {
+    const re = new RegExp(`itemprop=["']${prop}["'][^>]*>([^<]{2,300})<`, 'gi');
+    const results: string[] = [];
     let m;
-    while ((m = re.exec(html)) !== null) {
-      if (isProductImage(m[1])) { imgSet.add(m[1]); if (imgSet.size >= 10) break; }
-    }
+    while ((m = re.exec(html)) !== null) results.push(m[1].trim());
+    return results;
+  };
+
+  const ldAgg = ld?.['aggregateRating'] as IDataObject | undefined;
+  const ratingRaw = coerceNumber(ldAgg?.['ratingValue']);
+  const rating = ratingRaw && ratingRaw >= 1 && ratingRaw <= 5 ? ratingRaw : null;
+  const caloriesVal = ld?.['nutrition'] as IDataObject | undefined;
+
+  return {
+    name:         coerceString(ld?.['name']),
+    cuisine:      coerceString(ld?.['recipeCuisine']),
+    cook_time:    coerceString(ld?.['cookTime']),
+    prep_time:    coerceString(ld?.['prepTime']),
+    total_time:   coerceString(ld?.['totalTime']),
+    yield:        typeof ld?.['recipeYield'] === 'object'
+                    ? (ld?.['recipeYield'] as IDataObject[])[0]?.toString() ?? null
+                    : coerceString(ld?.['recipeYield']),
+    ingredients:  extractList(ld?.['recipeIngredient']) ?? scrapeItemProp('recipeIngredient'),
+    instructions: extractList(ld?.['recipeInstructions']) ?? scrapeItemProp('recipeInstructions'),
+    rating,
+    review_count: coerceInt(ldAgg?.['reviewCount']) ?? coerceInt(ldAgg?.['ratingCount']),
+    calories:     coerceString(caloriesVal?.['calories']),
+  };
+}
+
+function extractJobFields(html: string, schemaBlocks: IDataObject[]): JobFields {
+  const ld     = findSchemaByType(schemaBlocks, 'JobPosting');
+  const org    = ld?.['hiringOrganization'] as IDataObject | undefined;
+  const loc    = ld?.['jobLocation'] as IDataObject | IDataObject[] | undefined;
+  const locObj = Array.isArray(loc) ? loc[0] : loc;
+  const addr   = locObj?.['address'] as IDataObject | undefined;
+
+  const location =
+    coerceString(addr?.['addressLocality']) ??
+    coerceString(addr?.['addressRegion']) ??
+    coerceString((locObj as IDataObject | undefined)?.['name']) ??
+    reGet(html, /itemprop=["']jobLocation["'][^>]*>[\s\S]*?itemprop=["']addressLocality["'][^>]*>([^<]{2,80})/) ??
+    null;
+
+  const remoteRaw = coerceString(ld?.['jobLocationType']);
+  const remote    = remoteRaw ? /remote/i.test(remoteRaw) : /\bremote\b/i.test(html) ? true : null;
+
+  const salaryObj  = ld?.['baseSalary'] as IDataObject | undefined;
+  const salaryVal  = salaryObj?.['value'] as IDataObject | undefined;
+  const salaryStr  =
+    (salaryVal?.['minValue'] != null && salaryVal?.['maxValue'] != null)
+      ? `${salaryVal['minValue']}–${salaryVal['maxValue']} ${coerceString(salaryVal?.['unitText']) ?? ''}`
+      : coerceString(salaryVal?.['value']) ?? coerceString(salaryObj?.['value']);
+
+  const descHtml = coerceString(ld?.['description']);
+  const description = descHtml ? truncate(stripHtml(descHtml), 2000) : null;
+
+  return {
+    title:           coerceString(ld?.['title']) ?? reGet(html, /<h1[^>]*>([\s\S]{1,200}?)<\/h1>/i)?.replace(/<[^>]+>/g, '').trim() ?? null,
+    company:         coerceString(org?.['name']) ?? reGet(html, /itemprop=["']hiringOrganization["'][^>]*>[\s\S]*?itemprop=["']name["'][^>]*>([^<]{2,80})/) ?? null,
+    location,
+    employment_type: coerceString(ld?.['employmentType']),
+    remote,
+    salary:          salaryStr ?? null,
+    date_posted:     coerceString(ld?.['datePosted']),
+    valid_through:   coerceString(ld?.['validThrough']),
+    description,
+  };
+}
+
+function extractEventFields(html: string, schemaBlocks: IDataObject[]): EventFields {
+  const ld  = findSchemaByType(schemaBlocks, 'Event', 'BusinessEvent', 'SocialEvent', 'Festival', 'MusicEvent');
+  const loc = ld?.['location'] as IDataObject | string | undefined;
+  const org = ld?.['organizer'] as IDataObject | string | undefined;
+  const off = ld?.['offers'] as IDataObject | IDataObject[] | undefined;
+  const offer = Array.isArray(off) ? off[0] : off;
+
+  const locationStr =
+    (loc && typeof loc === 'object'
+      ? coerceString((loc as IDataObject)['name']) ?? coerceString(((loc as IDataObject)['address'] as IDataObject | undefined)?.['streetAddress'])
+      : coerceString(loc)) ??
+    reGet(html, /itemprop=["']location["'][^>]*>[\s\S]*?itemprop=["']name["'][^>]*>([^<]{2,80})/) ??
+    null;
+
+  const statusRaw = coerceString(ld?.['eventStatus']);
+
+  return {
+    name:       coerceString(ld?.['name']) ?? reGet(html, /<h1[^>]*>([^<]{2,200})<\/h1>/i) ?? null,
+    start_date: coerceString(ld?.['startDate']),
+    end_date:   coerceString(ld?.['endDate']),
+    location:   locationStr,
+    organizer:  (org && typeof org === 'object' ? coerceString((org as IDataObject)['name']) : coerceString(org)) ?? null,
+    price:      coerceString(offer?.['price']),
+    status:     statusRaw ?? null,
+  };
+}
+
+function extractVideoFields(html: string, url: string, schemaBlocks: IDataObject[]): VideoFields {
+  const ld = findSchemaByType(schemaBlocks, 'VideoObject');
+
+  // YouTube-specific extraction
+  let viewCount: number | null = null;
+  if (/youtube\.com|youtu\.be/.test(url)) {
+    const vcM = html.match(/"viewCount"\s*:\s*"?([\d]+)"?/);
+    if (vcM) viewCount = parseInt(vcM[1], 10) || null;
   }
 
-  // ── Description ───────────────────────────────────────────────────────────
-  let description: string | null = null;
-  if (isAmazon) {
-    const descM = html.match(/id=["']productDescription["'][^>]*>([\s\S]{20,2000}?)<\/div>/i);
-    const bulM  = html.match(/id=["']feature-bullets["'][^>]*>([\s\S]{20,2000}?)<\/div>/i);
-    description = descM ? truncate(stripHtml(descM[1])) : bulM ? truncate(stripHtml(bulM[1])) : null;
-  }
-  if (!description) {
-    description =
-      (ldProduct?.['description'] != null ? truncate(String(ldProduct['description'])) : null) ??
-      (og['description'] ? truncate(og['description']) : null) ??
-      truncate(reGet(html, /<meta[^>]+name=["']description["'][^>]+content=["']([^"']{20,})["']/i)) ??
-      truncate(reGet(html, /itemprop=["']description["'][^>]*>\s*([\s\S]{20,1000}?)<\//i)) ??
-      null;
-  }
+  const thumbnail =
+    coerceString((ld?.['thumbnailUrl'] as string[] | string | undefined) instanceof Array
+      ? (ld?.['thumbnailUrl'] as string[])[0]
+      : ld?.['thumbnailUrl']) ??
+    reGet(html, /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i) ??
+    null;
 
-  // ── Similar URLs ──────────────────────────────────────────────────────────
-  const similarSeen = new Set<string>();
-  const similar_urls: string[] = [];
-  const origin = getOrigin(url);
-  const host   = hostname(url);
-  const linkRe = /href=["']([^"'#?]+)/gi;
-  let lm;
-  while ((lm = linkRe.exec(html)) !== null) {
-    const href = lm[1].trim();
-    if (!href) continue;
-    const full = href.startsWith('http') ? href
-               : href.startsWith('/')    ? `${origin}${href}`
-               : null;
-    if (!full || !full.includes(host)) continue;
-    const path = full.toLowerCase();
-    const looksLikeListing =
-      /\/(rooms?|listing|product|item|dp|p|sku|property|hotel|stay|rent|buy|shop|itm[a-z0-9]+)\/[a-z0-9_-]{3,}/i.test(path) ||
-      /\/p\/itm[a-z0-9]+/i.test(path) ||
-      /\/[a-z0-9-]+-\d{5,}/i.test(path);
-    const isNoise =
-      /\/(cart|signin|login|logout|account|wishlist|register|returns|help|contact|privacy|terms|sitemap|search|static|assets|fonts)\b/i.test(path) ||
-      /\.(css|js|svg|gif|ico|woff|ttf|pdf)(\?|$)/i.test(path) ||
-      path.includes('/itemid') ||
-      path.includes('callout') ||
-      path.endsWith('/p');
-    if (looksLikeListing && !isNoise && !similarSeen.has(full)) {
-      similarSeen.add(full);
-      similar_urls.push(full);
-      if (similar_urls.length >= 20) break;
-    }
-  }
+  return {
+    name:        coerceString(ld?.['name']) ?? reGet(html, /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i) ?? null,
+    duration:    coerceString(ld?.['duration']),
+    upload_date: coerceString(ld?.['uploadDate']),
+    thumbnail,
+    embed_url:   coerceString(ld?.['embedUrl']),
+    channel:     coerceString((ld?.['author'] as IDataObject | undefined)?.['name']) ?? null,
+    view_count:  viewCount ?? coerceInt(ld?.['interactionCount']),
+  };
+}
+
+// ─── Master extractor ─────────────────────────────────────────────────────────
+
+function extractData(html: string, url: string): ScrapedOutput {
+  const rawBlocks = extractStructuredData(html);
+  const schemas   = flattenSchemaBlocks(rawBlocks);
+  const pageType  = detectPageType(html, url, schemas);
+  const { og, meta } = extractMeta(html);
+
+  const title        = extractTitle(html, og, meta);
+  const author       = extractAuthor(html, schemas, og, meta);
+  const { published, modified } = extractDates(html, schemas, meta);
+  const bodyText     = extractBodyText(html);
+  const images       = extractImages(html, url);
+  const links        = extractLinks(html, url);
+  const language     = extractLanguage(html);
+
+  // Meta description (short summary, distinct from body_text)
+  const description =
+    og['description']?.trim() ||
+    meta['description']?.trim() ||
+    meta['twitter:description']?.trim() ||
+    null;
 
   return {
     url,
-    source,
-    scraped_at:    new Date().toISOString(),
-    name,
-    brand:         brand || null,
-    sku,
-    price:         priceFormatted,
-    price_numeric: priceNumeric,
-    currency,
-    availability,
-    rating,
-    review_count,
-    images:        [...imgSet].slice(0, 10),
-    description,
-    similar_urls,
+    source:       hostname(url),
+    scraped_at:   new Date().toISOString(),
+    page_type:    pageType,
+
+    title,
+    description:  description || null,
+    body_text:    bodyText,
+    author,
+    published_at: published,
+    modified_at:  modified,
+    language,
+    images,
+    links,
+
+    schema_types: schemaTypes(schemas),
+    schema_raw:   schemas,
+
+    // Populate only the relevant type-specific block; others are null
+    product:  pageType === 'product'  ? extractProductFields(html, url, schemas) : null,
+    recipe:   pageType === 'recipe'   ? extractRecipeFields(html, schemas)       : null,
+    job:      pageType === 'job'      ? extractJobFields(html, schemas)           : null,
+    event:    pageType === 'event'    ? extractEventFields(html, schemas)         : null,
+    video:    pageType === 'video'    ? extractVideoFields(html, url, schemas)    : null,
   };
 }
 
@@ -435,7 +811,7 @@ async function syphoonFetch(
     } catch (err: unknown) {
       const e = err as { statusCode?: number };
       if (e.statusCode === 402) throw new NodeOperationError(ctx.getNode(), 'Syphoon trial exhausted. Upgrade at syphoon.com.', { itemIndex });
-      if (e.statusCode === 401 || e.statusCode === 403) throw new NodeOperationError(ctx.getNode(), 'Invalid Syphoon API key. Get your key at syphoon.com → Dashboard → API Keys.', { itemIndex });
+      if (e.statusCode === 401 || e.statusCode === 403) throw new NodeOperationError(ctx.getNode(), 'Invalid Syphoon API key.', { itemIndex });
       if (e.statusCode === 429 && attempt < MAX_RETRIES) continue;
       if (attempt === MAX_RETRIES) throw new NodeApiError(ctx.getNode(), err as JsonObject, { itemIndex });
     }
@@ -453,7 +829,7 @@ export class Syphoon implements INodeType {
     group:       ['input'],
     version:     1,
     documentationUrl: 'https://docs.syphoon.com',
-    description: 'Scrape any URL and extract structured data. Works on e-commerce (Amazon, Flipkart), travel (Airbnb, Booking.com), restaurants, real estate, job listings, and any website. Returns: name, brand, SKU, price, rating, images, description, availability, and similar page links. To get your API key: visit syphoon.com → Sign Up → Dashboard → API Keys.',
+    description: 'Universal web scraper. Extracts structured data from any URL — articles, products, recipes, jobs, events, videos, forums, documentation, and more. Returns rich typed output with auto-detected page type.',
     defaults:    { name: 'Syphoon' },
     inputs:      ['main'],
     outputs:     ['main'],
@@ -465,11 +841,11 @@ export class Syphoon implements INodeType {
         type:        'string',
         default:     '',
         required:    true,
-        placeholder: 'https://amazon.com/dp/... or https://airbnb.com/rooms/...',
-        description: 'Any URL to scrape. Works on product pages, hotel listings, restaurant pages, job postings, real estate listings, and more.',
+        placeholder: 'https://example.com/any/page',
+        description: 'Any URL to scrape — product, article, recipe, job posting, event, video, forum thread, documentation page, or generic webpage.',
       },
       {
-        displayName: '🔑 Need an API key? Go to syphoon.com → Sign Up → Dashboard → API Keys. Then add it via Credentials → New → Syphoon API.',
+        displayName: '🔑 Need an API key? Go to syphoon.com → Sign Up → Dashboard → API Keys.',
         name:        'apiKeyNotice',
         type:        'notice',
         default:     '',
@@ -495,6 +871,7 @@ export class Syphoon implements INodeType {
               url,
               source:     hostname(url),
               scraped_at: new Date().toISOString(),
+              page_type:  'generic',
               error:      (error as Error).message,
             },
             pairedItem: i,
