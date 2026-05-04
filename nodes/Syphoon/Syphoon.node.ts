@@ -845,10 +845,10 @@ export class Syphoon implements INodeType {
         description: 'Any URL to scrape — product, article, recipe, job posting, event, video, forum thread, documentation page, or generic webpage.',
       },
       {
-        displayName: '🔑 Need an API key? Go to syphoon.com → Sign Up → Dashboard → API Keys.',
+        displayName: 'API Key Setup',
         name:        'apiKeyNotice',
         type:        'notice',
-        default:     '',
+        default:     'Need an API key? Go to syphoon.com → Sign Up → Dashboard → API Keys.',
       },
     ],
   };
